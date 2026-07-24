@@ -14,6 +14,7 @@ one improvement:
 | Branch | Change |
 |--------|--------|
 | `fix/store-currency` | Show revenue in the store's WooCommerce currency instead of hardcoded GBP |
+| `feature/engagement-metrics` | Per-variant engagement metrics: average scroll depth and active time on page |
 
 All credit for the plugin goes to its author. This repository only exists to propose
 changes back upstream.
