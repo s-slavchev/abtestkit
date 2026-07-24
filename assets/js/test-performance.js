@@ -1901,7 +1901,7 @@ if (loading && !payload) {
     // Real relative uplift of the leader over the other version, with the
     // metric spelled out — e.g. "(+194% revenue per visitor)" — instead of
     // the difference between the two shares of the leader bar.
-    const leaderMetricLabel = isRevenueGoal ? 'revenue per visitor' : 'conversion rate';
+    const leaderMetricLabel = isRevenueGoal ? 'RPV' : 'conversion rate';
     const leaderBase = Math.min(leaderMetricA, leaderMetricB);
     const leaderTop = Math.max(leaderMetricA, leaderMetricB);
     const leaderUpliftText =
