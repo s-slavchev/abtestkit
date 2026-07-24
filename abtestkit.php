@@ -15440,6 +15440,49 @@ function abtestkit_create_event_table() {
             )
         );
     }
+    // Engagement metrics: dbDelta is unreliable with ENUM changes, so force-heal
+    // the new enum value and columns the same way as order_id / amount above.
+    // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+    $event_type_definition = $wpdb->get_row(
+        $wpdb->prepare( 'SHOW COLUMNS FROM %i LIKE %s', $table, 'event_type' ),
+        ARRAY_A
+    );
+
+    if (
+        is_array( $event_type_definition )
+        && isset( $event_type_definition['Type'] )
+        && strpos( $event_type_definition['Type'], "'engagement'" ) === false
+    ) {
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+        $wpdb->query(
+            $wpdb->prepare(
+                "ALTER TABLE %i MODIFY `event_type` ENUM('impression','click','purchase','decision','decision_applied','stale','protocol_warning','engagement')",
+                $table
+            )
+        );
+    }
+
+    if ( is_array( $columns ) ) {
+        if ( ! in_array( 'scroll_pct', $columns, true ) ) {
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+            $wpdb->query(
+                $wpdb->prepare(
+                    'ALTER TABLE %i ADD COLUMN `scroll_pct` TINYINT UNSIGNED NULL AFTER `excluded_reason`',
+                    $table
+                )
+            );
+        }
+
+        if ( ! in_array( 'time_sec', $columns, true ) ) {
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+            $wpdb->query(
+                $wpdb->prepare(
+                    'ALTER TABLE %i ADD COLUMN `time_sec` INT UNSIGNED NULL AFTER `scroll_pct`',
+                    $table
+                )
+            );
+        }
+    }
     // phpcs:enable WordPress.DB.DirectDatabaseQuery.SchemaChange
 
     update_option( 'abtestkit_events_schema_version', 4, false );
