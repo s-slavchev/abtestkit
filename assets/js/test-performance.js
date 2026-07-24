@@ -1778,6 +1778,14 @@ if (loading && !payload) {
     }
 
     const stats = payload.stats || { A: {}, B: {} };
+    const evaluation = payload.evaluation || null;
+    const winProbA = evaluation && typeof evaluation.probA === 'number' ? evaluation.probA : null;
+    const winProbB = evaluation && typeof evaluation.probB === 'number' ? evaluation.probB : null;
+    const hasWinProb = winProbA !== null && winProbB !== null;
+    const winProbHelp =
+      'Bayesian probability that this version beats the other one, given the data so far. ' +
+      'A winner is declared automatically once this reaches the confidence threshold ' +
+      '(95%, or 90% for the Fast decision rule) and the credible interval rules out a tie.';
     const timeline = payload.timeline || [];
     const isRevenueGoal = payload.goal === 'purchase';
     const previewA = payload.preview_a || '';
@@ -3375,6 +3383,18 @@ if (loading && !payload) {
                       upliftDisplayA
                     ),
                   ]),
+                hasWinProb &&
+                  h('div', null, [
+                    h(
+                      'div',
+                      { style: statLabelStyle },
+                      [
+                        'Chance to Win',
+                        helpTip('win-prob-a', winProbHelp),
+                      ]
+                    ),
+                    h('div', { style: statValueStyle }, `${(winProbA * 100).toFixed(1)}%`),
+                  ]),
               ].filter(Boolean)
             ),
             h(
@@ -3558,6 +3578,18 @@ if (loading && !payload) {
                       { style: statValueStyle },
                       upliftDisplayB
                     ),
+                  ]),
+                hasWinProb &&
+                  h('div', null, [
+                    h(
+                      'div',
+                      { style: statLabelStyle },
+                      [
+                        'Chance to Win',
+                        helpTip('win-prob-b', winProbHelp, 'left'),
+                      ]
+                    ),
+                    h('div', { style: statValueStyle }, `${(winProbB * 100).toFixed(1)}%`),
                   ]),
               ].filter(Boolean)
             ),

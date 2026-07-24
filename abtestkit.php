@@ -2509,6 +2509,8 @@ register_rest_route(
                         ? $cached['test']['stats']
                         : abtestkit_pt_stats( $test );
 
+                    $cached['test']['evaluation'] = abtestkit_pt_evaluation_for_test( $test );
+
                     $cached['test']['health'] = abtestkit_pt_health_summary( $test, $cached_stats, [
                         'http_excluded_count' => isset( $cached['test']['http_excluded_count'] ) ? (int) $cached['test']['http_excluded_count'] : 0,
                         'http_excluded_last'  => isset( $cached['test']['http_excluded_last'] ) ? (string) $cached['test']['http_excluded_last'] : '',
@@ -2846,6 +2848,8 @@ register_rest_route(
                     );
                 }
 
+                $evaluation = abtestkit_pt_evaluation_for_test( $test );
+
                 $goal = '';
                 if ( isset( $test['goal'] ) ) {
                     $goal = abtestkit_pt_normalize_goal_for_display( $test['goal'] );
@@ -2905,6 +2909,7 @@ register_rest_route(
                         'control_id'          => $control_id,
                         'variant_id'          => $variant_id,
                         'stats'               => $stats,
+                        'evaluation'          => $evaluation,
                         'health'              => $health,
                         'auto_paused_broken'    => ! empty( $test['auto_paused_broken'] ),
                         'auto_paused_broken_at' => isset( $test['auto_paused_broken_at'] ) ? (int) $test['auto_paused_broken_at'] : 0,
@@ -15104,6 +15109,33 @@ function abtestkit_uninstall() {
     if ( function_exists( 'wp_cache_clear_cache' ) ) {
         wp_cache_clear_cache();
     }
+}
+
+function abtestkit_pt_evaluation_for_test( array $test ) {
+    $test_id    = isset( $test['id'] ) ? (string) $test['id'] : '';
+    $control_id = isset( $test['control_id'] ) ? (int) $test['control_id'] : 0;
+
+    if ( $test_id === '' || $control_id <= 0 ) {
+        return null;
+    }
+
+    $req = new WP_REST_Request( 'GET', '/abtestkit/v1/evaluate' );
+    $req->set_param( 'abTestId', $test_id );
+    $req->set_param( 'post_id', $control_id );
+
+    $res  = abtestkit_handle_evaluate( $req );
+    $data = ( $res instanceof WP_REST_Response ) ? $res->get_data() : (array) $res;
+
+    if ( ! is_array( $data ) || ! isset( $data['probA'], $data['probB'] ) ) {
+        return null;
+    }
+
+    return [
+        'probA'   => (float) $data['probA'],
+        'probB'   => (float) $data['probB'],
+        'winner'  => isset( $data['winner'] ) ? (string) $data['winner'] : '',
+        'message' => isset( $data['message'] ) ? (string) $data['message'] : '',
+    ];
 }
 
 function abtestkit_events_table_has_column( string $column ) : bool {
