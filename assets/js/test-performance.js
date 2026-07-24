@@ -1786,6 +1786,12 @@ if (loading && !payload) {
       'Bayesian probability that this version beats the other one, given the data so far. ' +
       'A winner is declared automatically once this reaches the confidence threshold ' +
       '(95%, or 90% for the Fast decision rule) and the credible interval rules out a tie.';
+    const winProbGated = !!(evaluation && evaluation.message);
+    const winProbTip = winProbGated
+      ? `${evaluation.message} Probabilities are not evaluated until the test minimums are met. ${winProbHelp}`
+      : winProbHelp;
+    const winProbDisplayA = winProbGated ? '—' : `${(winProbA * 100).toFixed(1)}%`;
+    const winProbDisplayB = winProbGated ? '—' : `${(winProbB * 100).toFixed(1)}%`;
     const timeline = payload.timeline || [];
     const isRevenueGoal = payload.goal === 'purchase';
     const previewA = payload.preview_a || '';
@@ -3390,10 +3396,10 @@ if (loading && !payload) {
                       { style: statLabelStyle },
                       [
                         'Chance to Win',
-                        helpTip('win-prob-a', winProbHelp),
+                        helpTip('win-prob-a', winProbTip),
                       ]
                     ),
-                    h('div', { style: statValueStyle }, `${(winProbA * 100).toFixed(1)}%`),
+                    h('div', { style: statValueStyle }, winProbDisplayA),
                   ]),
               ].filter(Boolean)
             ),
@@ -3586,10 +3592,10 @@ if (loading && !payload) {
                       { style: statLabelStyle },
                       [
                         'Chance to Win',
-                        helpTip('win-prob-b', winProbHelp, 'left'),
+                        helpTip('win-prob-b', winProbTip, 'left'),
                       ]
                     ),
-                    h('div', { style: statValueStyle }, `${(winProbB * 100).toFixed(1)}%`),
+                    h('div', { style: statValueStyle }, winProbDisplayB),
                   ]),
               ].filter(Boolean)
             ),
