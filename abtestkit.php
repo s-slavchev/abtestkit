@@ -11288,6 +11288,7 @@ add_action( 'admin_enqueue_scripts', function( $hook ) {
             'dashboardUrl' => admin_url( 'admin.php?page=abtestkit-dashboard' ),
             'adminAction'  => admin_url( 'admin-post.php?action=abtestkit_pt_action' ),
             'adminNonce'   => wp_create_nonce( 'abtestkit_pt_action' ),
+            'currency'     => function_exists( 'get_woocommerce_currency' ) ? get_woocommerce_currency() : 'GBP',
         ] );
     }
 } );

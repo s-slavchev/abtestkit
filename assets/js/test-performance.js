@@ -1888,7 +1888,7 @@ if (loading && !payload) {
     const currency = (value) =>
       new Intl.NumberFormat(undefined, {
         style: 'currency',
-        currency: 'GBP',
+        currency: (window.abtestkitTestPerformance && window.abtestkitTestPerformance.currency) || 'GBP',
         minimumFractionDigits: 2,
         maximumFractionDigits: 2,
       }).format(Number(value || 0));
