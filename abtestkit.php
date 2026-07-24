@@ -2509,6 +2509,8 @@ register_rest_route(
                         ? $cached['test']['stats']
                         : abtestkit_pt_stats( $test );
 
+                    $cached['test']['engagement'] = abtestkit_pt_engagement_stats( $test_id );
+
                     $cached['test']['health'] = abtestkit_pt_health_summary( $test, $cached_stats, [
                         'http_excluded_count' => isset( $cached['test']['http_excluded_count'] ) ? (int) $cached['test']['http_excluded_count'] : 0,
                         'http_excluded_last'  => isset( $cached['test']['http_excluded_last'] ) ? (string) $cached['test']['http_excluded_last'] : '',
@@ -2905,6 +2907,7 @@ register_rest_route(
                         'control_id'          => $control_id,
                         'variant_id'          => $variant_id,
                         'stats'               => $stats,
+                        'engagement'          => abtestkit_pt_engagement_stats( $test_id ),
                         'health'              => $health,
                         'auto_paused_broken'    => ! empty( $test['auto_paused_broken'] ),
                         'auto_paused_broken_at' => isset( $test['auto_paused_broken_at'] ) ? (int) $test['auto_paused_broken_at'] : 0,
@@ -3474,7 +3477,7 @@ function abtestkit_log_event_to_db( $type, $post_id, $ab_test_id, $variant, arra
     // keep IDs tight and types sane
     $ab_test_id = abtestkit_sanitize_test_id( $ab_test_id );
     $variant    = ( $variant === 'A' || $variant === 'B' ) ? $variant : '';
-    $allowed    = [ 'impression', 'click', 'purchase', 'decision', 'decision_applied', 'stale', 'protocol_warning' ];
+    $allowed    = [ 'impression', 'click', 'purchase', 'decision', 'decision_applied', 'stale', 'protocol_warning', 'engagement' ];
     $event_type = in_array( $type, $allowed, true ) ? $type : 'impression';
 
     // Privacy-safe storage: hash IP / UA so we keep light dedupe value without raw personal data.
@@ -3583,6 +3586,18 @@ function abtestkit_log_event_to_db( $type, $post_id, $ab_test_id, $variant, arra
         '%s', // ip
         '%s', // user_agent
     ];
+
+    // Engagement metrics (scroll depth % / active seconds) — only when the columns exist.
+    if (
+        $event_type === 'engagement'
+        && abtestkit_events_table_has_column( 'scroll_pct' )
+        && abtestkit_events_table_has_column( 'time_sec' )
+    ) {
+        $data['scroll_pct'] = isset( $extra['scroll_pct'] ) ? max( 0, min( 100, absint( $extra['scroll_pct'] ) ) ) : null;
+        $data['time_sec']   = isset( $extra['time_sec'] ) ? max( 0, min( 3600, absint( $extra['time_sec'] ) ) ) : null;
+        $format[]           = '%d'; // scroll_pct
+        $format[]           = '%d'; // time_sec
+    }
 
     // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.PreparedSQL.NotPrepared
     $wpdb->insert( ABTESTKIT_EVENTS_TABLE, $data, $format );
@@ -5004,8 +5019,8 @@ function abtestkit_handle_track( WP_REST_Request $request ) {
         ] );
     }
 
-    $valid_types   = [ 'impression', 'click', 'decision', 'decision_applied', 'stale', 'protocol_warning' ];
-    $needs_variant = in_array( $type, [ 'impression', 'click', 'decision', 'decision_applied', 'protocol_warning' ], true );
+    $valid_types   = [ 'impression', 'click', 'decision', 'decision_applied', 'stale', 'protocol_warning', 'engagement' ];
+    $needs_variant = in_array( $type, [ 'impression', 'click', 'decision', 'decision_applied', 'protocol_warning', 'engagement' ], true );
 
     if (
         empty( $ab_id ) ||
@@ -5130,14 +5145,21 @@ function abtestkit_handle_track( WP_REST_Request $request ) {
         abtestkit_safe_set_cookie( $click_cookie_name, '1', 0 );
     }
 
+    $event_extra = [
+        'protocol' => 'https',
+    ];
+
+    if ( $type === 'engagement' ) {
+        $event_extra['scroll_pct'] = max( 0, min( 100, absint( $body['scroll'] ?? 0 ) ) );
+        $event_extra['time_sec']   = max( 0, min( 3600, absint( $body['seconds'] ?? 0 ) ) );
+    }
+
     abtestkit_log_event_to_db(
         $type,
         $post_id,
         $ab_id,
         $variant,
-        [
-            'protocol' => 'https',
-        ]
+        $event_extra
     );
 
     if ( $type === 'click' && strpos( $ab_id, 'pt-' ) === 0 ) {
@@ -14779,6 +14801,68 @@ add_filter( 'woocommerce_product_variation_get_sale_price', function( $price, $p
 
   if (!Array.isArray(cfg.targets)) cfg.targets = [];
 
+  // --- Engagement tracking (max scroll depth + active time on page) ---------
+  // Sends one 'engagement' event per pageview when the visitor leaves or
+  // hides the tab, regardless of the configured conversion goal.
+  if (window.location.protocol === "https:") {
+    (function(){
+      var engMaxScroll = 0;
+      var engAccumMs = 0;
+      var engVisibleSince = (document.visibilityState !== "hidden") ? Date.now() : null;
+      var engSent = false;
+
+      function engOnScroll() {
+        var d = getScrollDepthPercent();
+        if (d > engMaxScroll) engMaxScroll = d;
+      }
+
+      function engSend() {
+        if (engSent) return;
+        if (engVisibleSince) {
+          engAccumMs += Date.now() - engVisibleSince;
+          engVisibleSince = null;
+        }
+        var secs = Math.min(3600, Math.round(engAccumMs / 1000));
+        if (secs < 1 && engMaxScroll <= 0) return;
+        engSent = true;
+        fetch(cfg.rest + "/track?t=" + Date.now(), {
+          method: "POST",
+          credentials: "same-origin",
+          keepalive: true,
+          cache: "no-store",
+          headers: {
+            "Content-Type": "application/json",
+            "X-WP-Nonce": cfg.nonce
+          },
+          body: JSON.stringify({
+            type: "engagement",
+            abTestId: cfg.abTestId,
+            postId: cfg.postId,
+            index: 0,
+            variant: cfg.variant,
+            protocol: "https",
+            scroll: engMaxScroll,
+            seconds: secs
+          })
+        }).catch(function(){});
+      }
+
+      window.addEventListener("scroll", engOnScroll, { passive: true, capture: true });
+      window.addEventListener("resize", engOnScroll, { passive: true, capture: true });
+      window.addEventListener("load", engOnScroll, { passive: true });
+      setTimeout(engOnScroll, 300);
+
+      document.addEventListener("visibilitychange", function(){
+        if (document.visibilityState === "hidden") {
+          engSend();
+        } else if (!engSent && !engVisibleSince) {
+          engVisibleSince = Date.now();
+        }
+      });
+      window.addEventListener("pagehide", engSend);
+    })();
+  }
+
   // --- Helpers --------------------------------------------------------------
   function trackClickOnce() {
     var key = "ab-pt-clicked-" + cfg.abTestId;
@@ -15106,6 +15190,56 @@ function abtestkit_uninstall() {
     }
 }
 
+function abtestkit_pt_engagement_stats( string $test_id ) : array {
+    global $wpdb;
+
+    $out = [
+        'A' => [ 'count' => 0, 'avg_scroll' => 0.0, 'avg_time' => 0.0 ],
+        'B' => [ 'count' => 0, 'avg_scroll' => 0.0, 'avg_time' => 0.0 ],
+    ];
+
+    if (
+        $test_id === ''
+        || ! abtestkit_events_table_has_column( 'scroll_pct' )
+        || ! abtestkit_events_table_has_column( 'time_sec' )
+    ) {
+        return $out;
+    }
+
+    // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+    $rows = $wpdb->get_results(
+        $wpdb->prepare(
+            "SELECT variant,
+                    COUNT(*) AS c,
+                    COALESCE(AVG(scroll_pct), 0) AS avg_scroll,
+                    COALESCE(AVG(time_sec), 0)   AS avg_time
+             FROM %i
+             WHERE ab_test_id = %s
+               AND event_type = 'engagement'
+             GROUP BY variant",
+            ABTESTKIT_EVENTS_TABLE,
+            $test_id
+        ),
+        ARRAY_A
+    );
+
+    foreach ( (array) $rows as $row ) {
+        $variant = isset( $row['variant'] ) ? (string) $row['variant'] : '';
+
+        if ( $variant !== 'A' && $variant !== 'B' ) {
+            continue;
+        }
+
+        $out[ $variant ] = [
+            'count'      => isset( $row['c'] ) ? (int) $row['c'] : 0,
+            'avg_scroll' => isset( $row['avg_scroll'] ) ? round( (float) $row['avg_scroll'], 1 ) : 0.0,
+            'avg_time'   => isset( $row['avg_time'] ) ? round( (float) $row['avg_time'], 1 ) : 0.0,
+        ];
+    }
+
+    return $out;
+}
+
 function abtestkit_events_table_has_column( string $column ) : bool {
     global $wpdb;
 
@@ -15138,11 +15272,13 @@ function abtestkit_create_event_table() {
         post_id BIGINT,
         ab_test_id VARCHAR(64),
         variant CHAR(1),
-        event_type ENUM('impression','click','purchase','decision','decision_applied','stale','protocol_warning'),
+        event_type ENUM('impression','click','purchase','decision','decision_applied','stale','protocol_warning','engagement'),
         order_id BIGINT NULL,
         amount DECIMAL(18,2) NULL,
         protocol VARCHAR(10) NULL,
         excluded_reason VARCHAR(50) NULL,
+        scroll_pct TINYINT UNSIGNED NULL,
+        time_sec INT UNSIGNED NULL,
         ip VARCHAR(45),
         user_agent TEXT,
         KEY idx_time (time),

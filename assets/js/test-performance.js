@@ -1778,6 +1778,20 @@ if (loading && !payload) {
     }
 
     const stats = payload.stats || { A: {}, B: {} };
+    const engagement = payload.engagement || { A: {}, B: {} };
+    const engCountA = Number((engagement.A && engagement.A.count) || 0);
+    const engCountB = Number((engagement.B && engagement.B.count) || 0);
+    const avgScrollA = Number((engagement.A && engagement.A.avg_scroll) || 0);
+    const avgScrollB = Number((engagement.B && engagement.B.avg_scroll) || 0);
+    const avgTimeA = Number((engagement.A && engagement.A.avg_time) || 0);
+    const avgTimeB = Number((engagement.B && engagement.B.avg_time) || 0);
+    const hasEngagement = engCountA > 0 || engCountB > 0;
+    const formatDuration = (value) => {
+      const total = Math.max(0, Math.round(Number(value || 0)));
+      const mins = Math.floor(total / 60);
+      const secs = total % 60;
+      return mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+    };
     const timeline = payload.timeline || [];
     const isRevenueGoal = payload.goal === 'purchase';
     const previewA = payload.preview_a || '';
@@ -3375,6 +3389,36 @@ if (loading && !payload) {
                       upliftDisplayA
                     ),
                   ]),
+                hasEngagement &&
+                  h('div', null, [
+                    h(
+                      'div',
+                      { style: statLabelStyle },
+                      [
+                        'Avg. Scroll Depth',
+                        helpTip(
+                          'avg-scroll-a',
+                          'Average maximum scroll depth reached by visitors on this version.'
+                        ),
+                      ]
+                    ),
+                    h('div', { style: statValueStyle }, `${Math.round(avgScrollA)}%`),
+                  ]),
+                hasEngagement &&
+                  h('div', null, [
+                    h(
+                      'div',
+                      { style: statLabelStyle },
+                      [
+                        'Avg. Time on Page',
+                        helpTip(
+                          'avg-time-a',
+                          'Average active time visitors spent on this version (tab visible).'
+                        ),
+                      ]
+                    ),
+                    h('div', { style: statValueStyle }, formatDuration(avgTimeA)),
+                  ]),
               ].filter(Boolean)
             ),
             h(
@@ -3558,6 +3602,38 @@ if (loading && !payload) {
                       { style: statValueStyle },
                       upliftDisplayB
                     ),
+                  ]),
+                hasEngagement &&
+                  h('div', null, [
+                    h(
+                      'div',
+                      { style: statLabelStyle },
+                      [
+                        'Avg. Scroll Depth',
+                        helpTip(
+                          'avg-scroll-b',
+                          'Average maximum scroll depth reached by visitors on this version.',
+                          'left'
+                        ),
+                      ]
+                    ),
+                    h('div', { style: statValueStyle }, `${Math.round(avgScrollB)}%`),
+                  ]),
+                hasEngagement &&
+                  h('div', null, [
+                    h(
+                      'div',
+                      { style: statLabelStyle },
+                      [
+                        'Avg. Time on Page',
+                        helpTip(
+                          'avg-time-b',
+                          'Average active time visitors spent on this version (tab visible).',
+                          'left'
+                        ),
+                      ]
+                    ),
+                    h('div', { style: statValueStyle }, formatDuration(avgTimeB)),
                   ]),
               ].filter(Boolean)
             ),
