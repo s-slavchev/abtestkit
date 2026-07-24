@@ -1,0 +1,111 @@
+/* admin.css */
+.abtestkit-targets-input input {
+  color: transparent !important;
+  caret-color: #000;
+}
+
+.abtestkit-targets-input input:focus {
+  color: #1d2327 !important; /* reveal text when focused */
+}
+
+/* Hide the Split field input + Save button in the Page Tests dashboard */
+.abtestkit-pt td.split-cell form.split-inline {
+  display: none !important;
+}
+
+/* Show a simple read-only text instead */
+.abtestkit-pt td.split-cell::after {
+  content: "50% to Version B";
+  color: #1d2327;
+}
+
+/* ——— Status cell layout & compact icons ——— */
+.abtestkit-pt td.status-cell{
+  display:flex;
+  align-items:center;
+  gap:8px;               /* space between icon, label, winner note */
+  white-space:nowrap;    /* keep label on one line */
+}
+
+.abtestkit-pt .abk-ico{
+  display:inline-block;
+  width:14px;
+  height:14px;
+  line-height:14px;
+  flex:0 0 14px;
+}
+
+/* green dot for “Running” */
+.abtestkit-pt .abk-ico--dot{
+  background:#22a05f;
+  border-radius:50%;
+}
+
+/* small green tick for “Complete” (CSS-drawn so no images needed) */
+.abtestkit-pt .abk-ico--tick{
+  position:relative;
+}
+.abtestkit-pt .abk-ico--tick::before{
+  content:"";
+  position:absolute;
+  left:2px;
+  top:3px;
+  width:8px;
+  height:4px;
+  border-left:2px solid #22a05f;
+  border-bottom:2px solid #22a05f;
+  transform:rotate(-45deg);
+}
+
+/* neutral pause icon for “Paused” */
+.abtestkit-pt .abk-ico--pause{
+  position:relative;
+}
+.abtestkit-pt .abk-ico--pause::before,
+.abtestkit-pt .abk-ico--pause::after{
+  content:"";
+  position:absolute;
+  top:1px;
+  width:3px;
+  height:12px;
+  background:#6c7781;
+  border-radius:1px;
+}
+.abtestkit-pt .abk-ico--pause::before{ left:3px; }
+.abtestkit-pt .abk-ico--pause::after { right:3px; }
+
+/* winner note spacing */
+.abtestkit-pt .winner-note{
+  margin-left:6px;
+}
+
+/* Make the Winner label bold */
+.abtestkit-status-label:has(+ .winner-note),
+.status-cell .abtestkit-status-label:contains("Winner") { font-weight: 700; }
+
+/* plugin-scoped admin button rounding */
+
+/* Scope ONLY inside your plugin pages */
+.abtestkit-admin-page .button,
+.abtestkit-admin-page .components-button,
+.abtestkit-admin-page .wp-core-ui .button,
+.abtestkit-admin-page .wp-core-ui .button-primary,
+.abtestkit-admin-page .wp-core-ui .button-secondary {
+    border-radius: 6px !important;
+}
+
+/* Ensure lists display correctly in Version A previews on the product test wizard */
+#abtestkit-pt-wizard-root .abtestkit-html-preview ul,
+#abtestkit-pt-wizard-root .abtestkit-html-preview ol {
+  list-style: disc;
+  margin-left: 1.5em;
+  padding-left: 1.5em;
+}
+
+#abtestkit-pt-wizard-root .abtestkit-html-preview ol {
+  list-style: decimal;
+}
+
+.abtestkit-test-performance-app {
+  margin-top: 36px;
+}
