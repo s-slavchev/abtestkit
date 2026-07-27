@@ -2020,6 +2020,17 @@ if (loading && !payload) {
       leaderMetricA > leaderMetricB ? 'A' :
       null;
 
+    // Real relative uplift of the leader over the other version, with the
+    // metric spelled out — e.g. "(+194% revenue per visitor)" — instead of
+    // the difference between the two shares of the leader bar.
+    const leaderMetricLabel = isRevenueGoal ? 'RPV' : 'conversion rate';
+    const leaderBase = Math.min(leaderMetricA, leaderMetricB);
+    const leaderTop = Math.max(leaderMetricA, leaderMetricB);
+    const leaderUpliftText =
+      winningVersion && leaderBase > 0
+        ? ` (+${Math.round(((leaderTop - leaderBase) / leaderBase) * 100)}% ${leaderMetricLabel})`
+        : '';
+
     const showUpliftA = isRevenueGoal && winningVersion === 'A';
     const showUpliftB = isRevenueGoal && winningVersion === 'B';
 
@@ -3330,10 +3341,10 @@ if (loading && !payload) {
                           color: '#111827'
                         }
                       },
-                      percentB > percentA
-                        ? `Version B is winning (+${percentB - percentA}%)`
-                        : percentA > percentB
-                        ? `Version A is winning (+${percentA - percentB}%)`
+                      leaderMetricB > leaderMetricA
+                        ? `Version B is leading${leaderUpliftText}`
+                        : leaderMetricA > leaderMetricB
+                        ? `Version A is leading${leaderUpliftText}`
                         : 'Versions are currently tied'
                     )
                   ]
