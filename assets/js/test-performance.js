@@ -1778,7 +1778,6 @@
         });
         return;
       }
-
       const keepAConfirmed = window.confirm(
         'Apply Version A winner? This will keep Version A as the winner and complete the test.'
       );
@@ -1877,6 +1876,20 @@ if (loading && !payload) {
     }
 
     const stats = payload.stats || { A: {}, B: {} };
+    const evaluation = payload.evaluation || null;
+    const winProbA = evaluation && typeof evaluation.probA === 'number' ? evaluation.probA : null;
+    const winProbB = evaluation && typeof evaluation.probB === 'number' ? evaluation.probB : null;
+    const hasWinProb = winProbA !== null && winProbB !== null;
+    const winProbHelp =
+      'Bayesian probability that this version beats the other one, given the data so far. ' +
+      'A winner is declared automatically once this reaches the confidence threshold ' +
+      '(95%, or 90% for the Fast decision rule) and the credible interval rules out a tie.';
+    const winProbGated = !!(evaluation && evaluation.message);
+    const winProbTip = winProbGated
+      ? `${evaluation.message} Probabilities are not evaluated until the test minimums are met. ${winProbHelp}`
+      : winProbHelp;
+    const winProbDisplayA = winProbGated ? '—' : `${(winProbA * 100).toFixed(1)}%`;
+    const winProbDisplayB = winProbGated ? '—' : `${(winProbB * 100).toFixed(1)}%`;
     const engagement = payload.engagement || {};
     const engagementA = engagement.A || {};
     const engagementB = engagement.B || {};
@@ -3634,6 +3647,18 @@ if (loading && !payload) {
                       upliftDisplayA
                     ),
                   ]),
+                hasWinProb &&
+                  h('div', null, [
+                    h(
+                      'div',
+                      { style: statLabelStyle },
+                      [
+                        'Chance to Win',
+                        helpTip('win-prob-a', winProbTip),
+                      ]
+                    ),
+                    h('div', { style: statValueStyle }, winProbDisplayA),
+                  ]),
               ].filter(Boolean)
             ),
             h(
@@ -3857,6 +3882,18 @@ if (loading && !payload) {
                       { style: statValueStyle },
                       upliftDisplayB
                     ),
+                  ]),
+                hasWinProb &&
+                  h('div', null, [
+                    h(
+                      'div',
+                      { style: statLabelStyle },
+                      [
+                        'Chance to Win',
+                        helpTip('win-prob-b', winProbTip, 'left'),
+                      ]
+                    ),
+                    h('div', { style: statValueStyle }, winProbDisplayB),
                   ]),
               ].filter(Boolean)
             ),
