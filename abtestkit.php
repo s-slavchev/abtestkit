@@ -3,7 +3,7 @@
  * Plugin Name:       abtestkit
  * Plugin URI:        https://www.abtestkit.io/
  * Description:       Increase WooCommerce Revenue with A/B Testing. Track Real Sales, Not Just Clicks.
- * Version:           1.5.0
+ * Version:           1.5.1
  * Author:            abtestkit
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
@@ -122,7 +122,7 @@ function abtestkit_flag_is_set( string $key ): bool {
 function abtestkit_build_telemetry_base(): array {
     return [
         'plugin'   => 'abtestkit',
-        'version'  => '1.5.0',
+        'version'  => '1.5.1',
         'site'     => md5( home_url() ), // anonymous hash
         'wp'       => get_bloginfo( 'version' ),
         'php'      => PHP_VERSION,
@@ -152,6 +152,10 @@ if ( ! defined( 'ABTESTKIT_COMPATIBILITY_PROMPT_OPTION' ) ) {
 
 if ( ! defined( 'ABTESTKIT_PREVIEW_HEALTH_OPTION' ) ) {
     define( 'ABTESTKIT_PREVIEW_HEALTH_OPTION', 'abtestkit_preview_health_failures' );
+}
+
+if ( ! defined( 'ABTESTKIT_HTML_RUNTIME_HEALTH_OPTION' ) ) {
+    define( 'ABTESTKIT_HTML_RUNTIME_HEALTH_OPTION', 'abtestkit_html_runtime_health' );
 }
 
 if ( ! defined( 'ABTESTKIT_REVIEW_URL' ) ) {
@@ -306,6 +310,110 @@ function abtestkit_preview_health_latest_for_test( array $test ): array {
     }
 
     return is_array( $latest ) ? $latest : [];
+}
+
+function abtestkit_html_runtime_health_get_all(): array {
+    $stored = get_option( ABTESTKIT_HTML_RUNTIME_HEALTH_OPTION, [] );
+
+    return is_array( $stored ) ? $stored : [];
+}
+
+function abtestkit_html_runtime_health_get( string $test_id ): array {
+    $test_id = abtestkit_sanitize_test_id( $test_id );
+
+    if ( $test_id === '' ) {
+        return [];
+    }
+
+    $stored = abtestkit_html_runtime_health_get_all();
+    $record = isset( $stored[ $test_id ] ) && is_array( $stored[ $test_id ] )
+        ? $stored[ $test_id ]
+        : [];
+
+    return $record;
+}
+
+function abtestkit_html_runtime_health_delete( string $test_id ): void {
+    $test_id = abtestkit_sanitize_test_id( $test_id );
+
+    if ( $test_id === '' ) {
+        return;
+    }
+
+    $stored = abtestkit_html_runtime_health_get_all();
+
+    if ( ! isset( $stored[ $test_id ] ) ) {
+        return;
+    }
+
+    unset( $stored[ $test_id ] );
+    update_option( ABTESTKIT_HTML_RUNTIME_HEALTH_OPTION, $stored, false );
+}
+
+function abtestkit_html_runtime_health_record( array $test, array $counts ): array {
+    $test_id    = isset( $test['id'] ) ? abtestkit_sanitize_test_id( $test['id'] ) : '';
+    $control_id = isset( $test['control_id'] ) ? absint( $test['control_id'] ) : 0;
+    $changes    = isset( $test['html_changes'] )
+        ? abtestkit_sanitize_custom_html_changes( $test['html_changes'] )
+        : [];
+    $total      = count( $changes );
+
+    if ( $test_id === '' || $control_id <= 0 || $total <= 0 ) {
+        return [];
+    }
+
+    $matched = isset( $counts['matched'] ) ? max( 0, (int) $counts['matched'] ) : 0;
+    $missing = isset( $counts['missing'] ) ? max( 0, (int) $counts['missing'] ) : 0;
+    $invalid = isset( $counts['invalid'] ) ? max( 0, (int) $counts['invalid'] ) : 0;
+
+    if ( $matched + $missing + $invalid !== $total ) {
+        return [];
+    }
+
+    $stored   = abtestkit_html_runtime_health_get_all();
+    $previous = isset( $stored[ $test_id ] ) && is_array( $stored[ $test_id ] )
+        ? $stored[ $test_id ]
+        : [];
+    $now      = time();
+
+    $invalid_streak = $invalid > 0
+        ? max( 0, (int) ( $previous['invalid_streak'] ?? 0 ) ) + 1
+        : 0;
+
+    $status = 'good';
+    if ( $invalid_streak >= 3 ) {
+        $status = 'broken';
+    } elseif ( $missing > 0 || $invalid > 0 ) {
+        $status = 'attention';
+    }
+
+    $record = [
+        'test_id'            => $test_id,
+        'control_id'         => $control_id,
+        'status'             => $status,
+        'matched'            => $matched,
+        'missing'            => $missing,
+        'invalid'            => $invalid,
+        'total'              => $total,
+        'reports'            => max( 0, (int) ( $previous['reports'] ?? 0 ) ) + 1,
+        'invalid_streak'     => $invalid_streak,
+        'last_reported_at'   => $now,
+        'last_reported_gmt'  => gmdate( 'Y-m-d H:i:s', $now ),
+    ];
+
+    $stored[ $test_id ] = $record;
+
+    uasort(
+        $stored,
+        static function( $a, $b ) {
+            return (int) ( $b['last_reported_at'] ?? 0 ) <=> (int) ( $a['last_reported_at'] ?? 0 );
+        }
+    );
+
+    $stored = array_slice( $stored, 0, 100, true );
+    update_option( ABTESTKIT_HTML_RUNTIME_HEALTH_OPTION, $stored, false );
+
+    return $record;
 }
 
 function abtestkit_compatibility_prompt_note_first_test_created(): void {
@@ -737,7 +845,245 @@ function abtestkit_telemetry_theme_family( string $stylesheet, string $template,
     return 'other_or_custom';
 }
 
-function abtestkit_build_deactivation_snapshot(): array {
+/**
+ * Return broad target categories without transmitting selectors or URLs.
+ */
+function abtestkit_telemetry_target_types( array $targets ): array {
+    $types = [];
+
+    foreach ( $targets as $target ) {
+        $target = trim( (string) $target );
+
+        if ( $target === '' ) {
+            continue;
+        }
+
+        if ( preg_match( '#^https?://#i', $target ) || strpos( $target, '/' ) === 0 || strpos( $target, '?' ) === 0 ) {
+            $types[] = 'url';
+        } elseif ( strpos( $target, '#' ) === 0 ) {
+            $types[] = 'id_selector';
+        } elseif ( strpos( $target, '.' ) !== false ) {
+            $types[] = 'class_selector';
+        } else {
+            $types[] = 'selector';
+        }
+    }
+
+    return array_values( array_unique( $types ) );
+}
+
+function abtestkit_telemetry_product_type( int $post_id ): string {
+    if ( $post_id <= 0 || get_post_type( $post_id ) !== 'product' || ! taxonomy_exists( 'product_type' ) ) {
+        return '';
+    }
+
+    $types = wp_get_object_terms(
+        $post_id,
+        'product_type',
+        [ 'fields' => 'slugs' ]
+    );
+
+    if ( is_wp_error( $types ) || empty( $types ) ) {
+        return '';
+    }
+
+    return sanitize_key( (string) reset( $types ) );
+}
+
+/**
+ * Summarise saved tests for an explicitly submitted deactivation report.
+ *
+ * Deliberately omit titles, post IDs, selectors, URLs, custom code/content,
+ * event rows, order/customer data and exact timestamps.
+ */
+function abtestkit_build_deactivation_tests_snapshot(): array {
+    if ( ! function_exists( 'abtestkit_pt_all' ) ) {
+        return [
+            'included' => 0,
+            'omitted'  => 0,
+            'items'    => [],
+        ];
+    }
+
+    $tests = array_values(
+        array_filter(
+            abtestkit_pt_all(),
+            static function( $test ): bool {
+                return is_array( $test );
+            }
+        )
+    );
+
+    $total = count( $tests );
+    $tests = array_slice( array_reverse( $tests ), 0, 25 );
+    $items = [];
+    $now   = time();
+
+    foreach ( $tests as $test ) {
+        $test_id    = isset( $test['id'] ) ? (string) $test['id'] : '';
+        $control_id = isset( $test['control_id'] ) ? (int) $test['control_id'] : 0;
+        $variant_id = isset( $test['variant_id'] ) ? (int) $test['variant_id'] : 0;
+        $targets    = ! empty( $test['links'] ) && is_array( $test['links'] )
+            ? array_values( $test['links'] )
+            : [];
+
+        $kind   = isset( $test['kind'] ) ? sanitize_key( (string) $test['kind'] ) : '';
+        $status = isset( $test['status'] ) ? sanitize_key( (string) $test['status'] ) : '';
+
+        $version_b_mode = '';
+        if ( in_array( $kind, [ 'custom_css', 'custom_html' ], true ) ) {
+            $version_b_mode = $kind;
+        } elseif ( $variant_id > 0 ) {
+            $is_owned_shadow = (
+                function_exists( 'abtestkit_is_shadow_product' )
+                && abtestkit_is_shadow_product( $variant_id )
+            ) || (
+                function_exists( 'abtestkit_is_shadow_variant' )
+                && abtestkit_is_shadow_variant( $variant_id )
+            );
+            $version_b_mode = $is_owned_shadow ? 'abtestkit_shadow' : 'existing_content';
+        }
+
+        $html_operations = [];
+        foreach ( (array) ( $test['html_changes'] ?? [] ) as $change ) {
+            if ( ! is_array( $change ) ) {
+                continue;
+            }
+
+            $operation = sanitize_key( (string) ( $change['operation'] ?? '' ) );
+            if ( in_array( $operation, [ 'replace_contents', 'insert_before', 'insert_after', 'prepend_inside', 'append_inside' ], true ) ) {
+                $html_operations[] = $operation;
+            }
+        }
+
+        $started_at  = max( 0, (int) ( $test['started_at'] ?? 0 ) );
+        $finished_at = max( 0, (int) ( $test['finished_at'] ?? 0 ) );
+
+        $items[] = [
+            'ref'                    => $test_id !== '' ? substr( hash_hmac( 'sha256', $test_id, wp_salt( 'auth' ) ), 0, 12 ) : '',
+            'kind'                   => $kind,
+            'status'                 => $status,
+            'goal'                   => isset( $test['goal'] ) ? sanitize_key( (string) $test['goal'] ) : '',
+            'decision_mode'          => isset( $test['decision_mode'] ) ? sanitize_key( (string) $test['decision_mode'] ) : '',
+            'decision_rule'          => isset( $test['decision_rule'] ) ? sanitize_key( (string) $test['decision_rule'] ) : '',
+            'split'                  => max( 0, min( 100, (int) ( $test['split'] ?? 50 ) ) ),
+            'min_impressions'        => max( 0, (int) ( $test['min_impressions'] ?? 0 ) ),
+            'min_conversions'        => max( 0, (int) ( $test['min_conversions'] ?? 0 ) ),
+            'control_type'           => $control_id > 0 ? sanitize_key( (string) get_post_type( $control_id ) ) : '',
+            'control_product_type'   => abtestkit_telemetry_product_type( $control_id ),
+            'control_exists'         => $control_id > 0 && get_post( $control_id ) ? 1 : 0,
+            'variant_type'           => $variant_id > 0 ? sanitize_key( (string) get_post_type( $variant_id ) ) : '',
+            'variant_product_type'   => abtestkit_telemetry_product_type( $variant_id ),
+            'variant_exists'         => $variant_id > 0 && get_post( $variant_id ) ? 1 : 0,
+            'version_b_mode'         => $version_b_mode,
+            'target_count'           => count( $targets ),
+            'target_types'           => abtestkit_telemetry_target_types( $targets ),
+            'scroll_depth'           => isset( $test['scroll_depth'] ) ? max( 0, min( 100, (int) $test['scroll_depth'] ) ) : 0,
+            'css_scope'              => isset( $test['css_scope'] ) ? sanitize_key( (string) $test['css_scope'] ) : '',
+            'custom_css_length'      => isset( $test['custom_css'] ) ? strlen( (string) $test['custom_css'] ) : 0,
+            'css_marker_count'       => isset( $test['css_markers'] ) && is_array( $test['css_markers'] ) ? count( $test['css_markers'] ) : 0,
+            'html_scope'             => isset( $test['html_scope'] ) ? sanitize_key( (string) $test['html_scope'] ) : '',
+            'html_change_count'      => isset( $test['html_changes'] ) && is_array( $test['html_changes'] ) ? count( $test['html_changes'] ) : 0,
+            'html_operation_types'   => array_values( array_unique( $html_operations ) ),
+            'started'                => $started_at > 0 ? 1 : 0,
+            'started_age_days'       => $started_at > 0 ? min( 36500, (int) floor( max( 0, $now - $started_at ) / DAY_IN_SECONDS ) ) : 0,
+            'finished'               => $finished_at > 0 ? 1 : 0,
+            'finished_age_days'      => $finished_at > 0 ? min( 36500, (int) floor( max( 0, $now - $finished_at ) / DAY_IN_SECONDS ) ) : 0,
+            'auto_paused_broken'     => ! empty( $test['auto_paused_broken'] ) ? 1 : 0,
+            'has_final_stats'        => ! empty( $test['final_stats'] ) && is_array( $test['final_stats'] ) ? 1 : 0,
+            'has_completed_snapshot' => ! empty( $test['snapshot_versions'] ) && is_array( $test['snapshot_versions'] ) ? 1 : 0,
+        ];
+    }
+
+    return [
+        'included' => count( $items ),
+        'omitted'  => max( 0, $total - count( $items ) ),
+        'items'    => $items,
+    ];
+}
+
+/**
+ * Accept only non-content wizard progress fields supplied by the admin browser.
+ */
+function abtestkit_sanitize_deactivation_wizard_snapshot( $snapshot ): array {
+    if ( ! is_array( $snapshot ) ) {
+        return [];
+    }
+
+    $out = [];
+
+    $allowed_strings = [
+        'ui'               => [ 'pt-wizard-1.2.0' ],
+        'step'             => [ 'select_type', 'select_custom_code_type', 'select_control', 'version_b_source', 'review_versions', 'choose_conversion_type', 'set_destination_url', 'set_scroll_depth', 'select_click_targets', 'summary' ],
+        'furthest_step'    => [ 'select_type', 'select_custom_code_type', 'select_control', 'version_b_source', 'review_versions', 'choose_conversion_type', 'set_destination_url', 'set_scroll_depth', 'select_click_targets', 'summary' ],
+        'kind'             => [ 'page', 'post', 'product', 'reusable_section', 'custom_code' ],
+        'custom_code_type' => [ 'custom_css', 'custom_html' ],
+        'scope'            => [ 'page', 'post', 'product' ],
+        'b_mode'           => [ 'duplicate', 'existing', 'custom_css', 'custom_html' ],
+        'goal'             => [ 'clicks', 'form', 'add_to_cart', 'purchase', 'destination_url', 'scroll_depth' ],
+        'click_scope'      => [ 'on_test_pages', 'other_page' ],
+        'decision_mode'    => [ 'auto', 'manual' ],
+        'decision_rule'    => [ 'fast', 'balanced', 'precise', 'manual' ],
+        'result'           => [ 'completed', 'abandoned' ],
+    ];
+
+    foreach ( $allowed_strings as $key => $allowed_values ) {
+        $value = $key === 'ui'
+            ? sanitize_text_field( (string) ( $snapshot[ $key ] ?? '' ) )
+            : sanitize_key( (string) ( $snapshot[ $key ] ?? '' ) );
+        if ( in_array( $value, $allowed_values, true ) ) {
+            $out[ $key ] = $value;
+        }
+    }
+
+    $bounded_ints = [
+        'step_index'          => [ 0, 50 ],
+        'furthest_step_index' => [ 0, 50 ],
+        'ms'                  => [ 0, DAY_IN_SECONDS * 1000 ],
+        'age_seconds'         => [ 0, YEAR_IN_SECONDS ],
+        'links_count'         => [ 0, 100 ],
+        'scroll_depth'        => [ 0, 100 ],
+        'custom_css_length'   => [ 0, 1000000 ],
+        'css_marker_count'    => [ 0, 1000 ],
+        'html_change_count'   => [ 0, 1000 ],
+    ];
+
+    foreach ( $bounded_ints as $key => $bounds ) {
+        if ( ! array_key_exists( $key, $snapshot ) || ! is_numeric( $snapshot[ $key ] ) ) {
+            continue;
+        }
+
+        $out[ $key ] = max( $bounds[0], min( $bounds[1], (int) $snapshot[ $key ] ) );
+    }
+
+    $boolean_fields = [
+        'completed',
+        'has_control',
+        'has_variant',
+        'has_temp_variant',
+        'edited_variant',
+        'seo_safe_existing_b',
+        'conversion_chosen',
+        'has_error',
+        'product_title_changed',
+        'product_price_changed',
+        'product_sale_price_changed',
+        'product_short_description_changed',
+        'product_long_description_changed',
+        'product_image_changed',
+        'product_gallery_changed',
+    ];
+
+    foreach ( $boolean_fields as $key ) {
+        if ( array_key_exists( $key, $snapshot ) ) {
+            $out[ $key ] = in_array( $snapshot[ $key ], [ 1, '1', true ], true ) ? 1 : 0;
+        }
+    }
+
+    return $out;
+}
+
+function abtestkit_build_deactivation_snapshot( array $wizard_snapshot = [], bool $include_test_state = true ): array {
     if ( ! function_exists( 'get_plugins' ) ) {
         require_once ABSPATH . 'wp-admin/includes/plugin.php';
     }
@@ -794,8 +1140,17 @@ function abtestkit_build_deactivation_snapshot(): array {
         }
     }
 
-    return [
-        'snapshot_version'     => 1,
+    $tests_created = $tests_total;
+    if ( function_exists( 'abtestkit_review_prompt_get_state' ) ) {
+        $review_prompt_state = abtestkit_review_prompt_get_state();
+        $tests_created       = max(
+            $tests_created,
+            (int) ( $review_prompt_state['tests_created'] ?? 0 )
+        );
+    }
+
+    $snapshot = [
+        'snapshot_version'     => $include_test_state ? 2 : 1,
         'wp_version'           => get_bloginfo( 'version' ),
         'php_version'          => PHP_VERSION,
         'environment'          => ( wp_get_environment_type() ?: 'production' ),
@@ -828,8 +1183,16 @@ function abtestkit_build_deactivation_snapshot(): array {
         'abtestkit_usage'      => [
             'tests_total'   => (int) $tests_total,
             'tests_running' => (int) $tests_running,
+            'tests_created' => (int) $tests_created,
         ],
     ];
+
+    if ( $include_test_state ) {
+        $snapshot['tests']  = abtestkit_build_deactivation_tests_snapshot();
+        $snapshot['wizard'] = abtestkit_sanitize_deactivation_wizard_snapshot( $wizard_snapshot );
+    }
+
+    return $snapshot;
 }
 
 /**
@@ -837,7 +1200,7 @@ function abtestkit_build_deactivation_snapshot(): array {
  * This is NOT full telemetry opt-in.
  * We only send when the user explicitly submits feedback (not skip/empty).
  */
-function abtestkit_telemetry_track_plugin_delete_reason( string $reason, string $detail = '', string $detail_tag = '', string $area = '' ): void {
+function abtestkit_telemetry_track_plugin_delete_reason( string $reason, string $detail = '', string $detail_tag = '', string $area = '', array $wizard_snapshot = [] ): void {
     $reason     = sanitize_key( (string) $reason );
     $detail     = substr( sanitize_textarea_field( (string) $detail ), 0, 1000 );
     $detail_tag = sanitize_key( (string) $detail_tag );
@@ -856,7 +1219,7 @@ function abtestkit_telemetry_track_plugin_delete_reason( string $reason, string 
             'detail_tag' => $detail_tag,
             'area'       => $area,
             'detail'     => $detail,
-            'snapshot'   => abtestkit_build_deactivation_snapshot(),
+            'snapshot'   => abtestkit_build_deactivation_snapshot( $wizard_snapshot ),
         ],
         true
     );
@@ -864,7 +1227,7 @@ function abtestkit_telemetry_track_plugin_delete_reason( string $reason, string 
 
 function abtestkit_build_compatibility_help_snapshot(): array {
     $snapshot = function_exists( 'abtestkit_build_deactivation_snapshot' )
-        ? abtestkit_build_deactivation_snapshot()
+        ? abtestkit_build_deactivation_snapshot( [], false )
         : [];
 
     $snapshot['cache_plugins'] = [
@@ -1158,7 +1521,7 @@ add_action( 'admin_enqueue_scripts', function ( $hook ) {
         'abtestkit-onboarding',
         plugins_url( 'assets/js/onboarding.js', __FILE__ ),
         array( 'wp-element', 'wp-components', 'wp-api-fetch' ),
-        '1.5.0',
+        '1.5.1',
         true
     );
 
@@ -1302,6 +1665,207 @@ if ( ! function_exists( 'abtestkit_custom_css_data_for_test' ) ) {
             'css_scope'   => isset( $test['css_scope'] ) ? sanitize_key( (string) $test['css_scope'] ) : '',
             'custom_css'  => isset( $test['custom_css'] ) ? abtestkit_sanitize_custom_css_input( $test['custom_css'] ) : '',
             'css_markers' => isset( $test['css_markers'] ) ? abtestkit_sanitize_custom_css_markers( $test['css_markers'] ) : [],
+        ];
+    }
+}
+
+// --- Custom HTML test helpers ---
+if ( ! function_exists( 'abtestkit_sanitize_custom_html_changes' ) ) {
+    function abtestkit_sanitize_custom_html_changes( $changes ) : array {
+        if ( ! is_array( $changes ) ) {
+            return [];
+        }
+
+        $allowed_html = wp_kses_allowed_html( 'post' );
+
+        $extra_tags = [
+            'section', 'article', 'header', 'footer', 'main', 'nav',
+            'button', 'picture', 'source', 'small', 'mark', 'time',
+            'svg', 'g', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon',
+        ];
+
+        $common_attributes = [
+            'id'          => true,
+            'class'       => true,
+            'style'       => true,
+            'title'       => true,
+            'role'        => true,
+            'tabindex'    => true,
+            'aria-label'  => true,
+            'aria-hidden' => true,
+            'aria-live'   => true,
+            'aria-*'      => true,
+            'data-*'      => true,
+        ];
+
+        foreach ( $allowed_html as $tag => $attributes ) {
+            $allowed_html[ $tag ] = array_merge(
+                is_array( $attributes ) ? $attributes : [],
+                $common_attributes
+            );
+        }
+
+        foreach ( $extra_tags as $tag ) {
+            if ( ! isset( $allowed_html[ $tag ] ) || ! is_array( $allowed_html[ $tag ] ) ) {
+                $allowed_html[ $tag ] = [];
+            }
+
+            $allowed_html[ $tag ] = array_merge( $allowed_html[ $tag ], $common_attributes );
+        }
+
+        $allowed_html['button'] = array_merge(
+            $allowed_html['button'],
+            [
+                'type'     => true,
+                'name'     => true,
+                'value'    => true,
+                'disabled' => true,
+            ]
+        );
+
+        $allowed_html['source'] = array_merge(
+            $allowed_html['source'],
+            [
+                'src'    => true,
+                'srcset' => true,
+                'sizes'  => true,
+                'type'   => true,
+                'media'  => true,
+            ]
+        );
+
+        $allowed_html['svg'] = array_merge(
+            $allowed_html['svg'],
+            [
+                'xmlns'        => true,
+                'viewbox'      => true,
+                'width'        => true,
+                'height'       => true,
+                'fill'         => true,
+                'stroke'       => true,
+                'stroke-width' => true,
+                'focusable'    => true,
+            ]
+        );
+
+        $svg_shape_attributes = [
+            'd'               => true,
+            'x'               => true,
+            'y'               => true,
+            'x1'              => true,
+            'x2'              => true,
+            'y1'              => true,
+            'y2'              => true,
+            'cx'              => true,
+            'cy'              => true,
+            'r'               => true,
+            'rx'              => true,
+            'ry'              => true,
+            'width'           => true,
+            'height'          => true,
+            'points'          => true,
+            'fill'            => true,
+            'fill-rule'       => true,
+            'clip-rule'       => true,
+            'stroke'          => true,
+            'stroke-width'    => true,
+            'stroke-linecap'  => true,
+            'stroke-linejoin' => true,
+            'transform'       => true,
+        ];
+
+        foreach ( [ 'g', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon' ] as $svg_tag ) {
+            $allowed_html[ $svg_tag ] = array_merge(
+                $allowed_html[ $svg_tag ],
+                $svg_shape_attributes
+            );
+        }
+
+        $clean = [];
+
+        foreach ( array_slice( $changes, 0, 20 ) as $change ) {
+            if ( ! is_array( $change ) ) {
+                continue;
+            }
+
+            $label = isset( $change['label'] )
+                ? substr( sanitize_text_field( wp_unslash( (string) $change['label'] ) ), 0, 120 )
+                : '';
+
+            $selector = isset( $change['selector'] )
+                ? sanitize_text_field( wp_unslash( (string) $change['selector'] ) )
+                : '';
+
+            $selector = trim( str_replace( [ "\0", '<', '`' ], '', $selector ) );
+            $selector = substr( $selector, 0, 1000 );
+
+            $operation = isset( $change['operation'] )
+                ? sanitize_key( wp_unslash( (string) $change['operation'] ) )
+                : 'replace_contents';
+
+            if ( ! in_array( $operation, [ 'replace_contents', 'insert_before', 'insert_after', 'prepend_inside', 'append_inside' ], true ) ) {
+                $operation = 'replace_contents';
+            }
+
+            $match_mode = isset( $change['match_mode'] )
+                ? sanitize_key( wp_unslash( (string) $change['match_mode'] ) )
+                : 'all';
+
+            if ( ! in_array( $match_mode, [ 'first', 'all' ], true ) ) {
+                $match_mode = 'all';
+            }
+
+            $html = isset( $change['html'] ) && is_string( $change['html'] )
+                ? wp_unslash( $change['html'] )
+                : '';
+
+            $html = str_replace( "\0", '', $html );
+            $intentionally_empty = trim( $html ) === '';
+
+            $html = preg_replace( '#<script\b[^>]*>.*?</script>#is', '', $html );
+            $html = preg_replace( '#<style\b[^>]*>.*?</style>#is', '', $html );
+            $html = preg_replace( '#<(?:iframe|object|embed)\b[^>]*>.*?</(?:iframe|object|embed)>#is', '', $html );
+            $html = preg_replace( '#<(?:iframe|object|embed)\b[^>]*/?>#is', '', $html );
+
+            if ( preg_match_all( '#<\s*([a-z][a-z0-9-]*-[a-z0-9-]+)\b#i', $html, $custom_tag_matches ) ) {
+                foreach ( array_unique( array_map( 'strtolower', $custom_tag_matches[1] ) ) as $custom_tag ) {
+                    if ( in_array( $custom_tag, [ 'script', 'style', 'iframe', 'object', 'embed' ], true ) ) {
+                        continue;
+                    }
+
+                    $allowed_html[ $custom_tag ] = $common_attributes;
+                }
+            }
+
+            $html = wp_kses( $html, $allowed_html );
+            $html = trim( (string) $html );
+
+            if ( $selector === '' || ( ! $intentionally_empty && $html === '' ) ) {
+                continue;
+            }
+
+            if ( $label === '' ) {
+                $label = __( 'Selected element', 'abtestkit' );
+            }
+
+            $clean[] = [
+                'label'      => $label,
+                'selector'   => $selector,
+                'operation'  => $operation,
+                'match_mode' => $match_mode,
+                'html'       => $html,
+            ];
+        }
+
+        return array_values( $clean );
+    }
+}
+
+if ( ! function_exists( 'abtestkit_custom_html_data_for_test' ) ) {
+    function abtestkit_custom_html_data_for_test( array $test ) : array {
+        return [
+            'html_scope'   => isset( $test['html_scope'] ) ? sanitize_key( (string) $test['html_scope'] ) : '',
+            'html_changes' => isset( $test['html_changes'] ) ? abtestkit_sanitize_custom_html_changes( $test['html_changes'] ) : [],
         ];
     }
 }
@@ -1632,6 +2196,55 @@ register_rest_route(
     ]
 );
 
+// --- Page Test Wizard: create a temporary Custom HTML preview token for unsaved wizard HTML ---
+register_rest_route(
+    'abtestkit/v1',
+    '/pt/custom-html-preview',
+    [
+        'methods'             => 'POST',
+        'permission_callback' => function () { return current_user_can( 'manage_options' ); },
+        'callback'            => function ( WP_REST_Request $req ) {
+            $control_id   = absint( $req->get_param( 'control_id' ) );
+            $html_changes = abtestkit_sanitize_custom_html_changes( $req->get_param( 'html_changes' ) );
+
+            if ( $control_id <= 0 ) {
+                return rest_ensure_response( [ 'ok' => false, 'error' => 'invalid_control' ] );
+            }
+
+            $post_type = get_post_type( $control_id );
+            if ( ! in_array( $post_type, [ 'page', 'post', 'product' ], true ) ) {
+                return rest_ensure_response( [ 'ok' => false, 'error' => 'invalid_control' ] );
+            }
+
+            if ( empty( $html_changes ) ) {
+                return rest_ensure_response( [ 'ok' => false, 'error' => 'empty_preview' ] );
+            }
+
+            $token = function_exists( 'wp_generate_uuid4' ) ? wp_generate_uuid4() : wp_hash( microtime( true ) . wp_rand() );
+            $key   = 'abtestkit_custom_html_preview_' . $token;
+
+            set_transient(
+                $key,
+                [
+                    'control_id'   => $control_id,
+                    'post_type'    => $post_type,
+                    'html_changes' => $html_changes,
+                    'user_id'      => get_current_user_id(),
+                    'created'      => time(),
+                ],
+                10 * MINUTE_IN_SECONDS
+            );
+
+            return rest_ensure_response(
+                [
+                    'ok'    => true,
+                    'token' => $token,
+                ]
+            );
+        },
+    ]
+);
+
 // --- Page Test Wizard: record admin preview iframe failures for the Health Checker ---
 register_rest_route(
     'abtestkit/v1',
@@ -1941,6 +2554,128 @@ register_rest_route(
                 );
             }
 
+            if ( $test_type === 'custom_html' ) {
+                $html_changes = abtestkit_sanitize_custom_html_changes( $req->get_param( 'html_changes' ) );
+                $html_scope   = sanitize_key( (string) $req->get_param( 'html_scope' ) );
+
+                if ( ! in_array( $html_scope, [ 'page', 'post', 'product' ], true ) ) {
+                    $html_scope = $post_type;
+                }
+
+                if ( empty( $html_changes ) ) {
+                    return rest_ensure_response( [ 'ok' => false, 'error' => 'missing_custom_html' ] );
+                }
+
+                $test = [
+                    'id'              => 'pt-' . substr( md5( $control_id . '|custom_html|' . microtime( true ) ), 0, 8 ),
+                    'title'           => $test_title !== '' ? $test_title : get_the_title( $control_id ),
+                    'control_id'      => $control_id,
+                    'variant_id'      => 0,
+                    'status'          => $start ? 'running' : 'draft',
+                    'split'           => $split,
+                    'decision_rule'   => $decision_rule,
+                    'decision_mode'   => $decision_mode,
+                    'min_impressions' => (int) $min_impressions,
+                    'min_conversions' => (int) $min_conversions,
+                    'cookie_ttl_days' => 30,
+                    'started_at'      => $start ? time() : 0,
+                    'finished_at'     => 0,
+                    'paused_at'       => 0,
+                    'paused_total'    => 0,
+                    'kind'            => 'custom_html',
+                    'html_scope'      => $html_scope,
+                    'html_changes'    => $html_changes,
+                ];
+
+                $conflicts = abtestkit_pt_conflicts_for_pages(
+                    (int) $test['control_id'],
+                    0,
+                    '',
+                    'custom_html'
+                );
+
+                if ( ! empty( $conflicts ) ) {
+                    return rest_ensure_response(
+                        [
+                            'ok'    => false,
+                            'error' => 'conflict_running',
+                            'info'  => [
+                                'message'   => 'This page is already in a running test, or a reusable section test is causing a conflict.',
+                                'conflicts' => $conflicts,
+                            ],
+                        ]
+                    );
+                }
+
+                $goal  = sanitize_key( $req->get_param( 'goal' ) );
+                $links = array_filter(
+                    array_map(
+                        'sanitize_text_field',
+                        (array) $req->get_param( 'links' )
+                    )
+                );
+
+                if ( $goal === 'button' || $goal === 'link' ) {
+                    $goal = 'clicks';
+                }
+
+                if ( $goal === 'destination' || $goal === 'url' || $goal === 'destination-url' ) {
+                    $goal = 'destination_url';
+                }
+
+                if ( in_array( $goal, [ 'scroll', 'scroll-depth', 'scroll_percentage', 'scroll-percentage' ], true ) ) {
+                    $goal = 'scroll_depth';
+                }
+
+                if ( in_array( $goal, [ 'clicks', 'form', 'add_to_cart', 'purchase', 'destination_url', 'scroll_depth' ], true ) ) {
+                    $test['goal'] = $goal;
+
+                    if ( $goal === 'scroll_depth' ) {
+                        $scroll_depth          = absint( $req->get_param( 'scroll_depth' ) );
+                        $allowed_scroll_depths = [ 25, 50, 75, 90 ];
+
+                        if ( ! in_array( $scroll_depth, $allowed_scroll_depths, true ) ) {
+                            $scroll_depth = 50;
+                        }
+
+                        $test['scroll_depth'] = $scroll_depth;
+                        $test['links']        = [];
+                    } elseif ( in_array( $goal, [ 'clicks', 'add_to_cart', 'destination_url' ], true ) ) {
+                        $test['links'] = $links;
+                    } else {
+                        $test['links'] = [];
+                    }
+                }
+
+                abtestkit_pt_put( $test );
+
+                if ( function_exists( 'abtestkit_review_prompt_note_test_created' ) ) {
+                    abtestkit_review_prompt_note_test_created();
+                }
+
+                if ( function_exists( 'abtestkit_compatibility_prompt_note_first_test_created' ) ) {
+                    abtestkit_compatibility_prompt_note_first_test_created();
+                }
+
+                if ( function_exists( 'abtestkit_telemetry_track_test_created' ) ) {
+                    abtestkit_telemetry_track_test_created( $test, [
+                        'b_mode'              => 'custom_html',
+                        'seo_safe_existing_b' => 1,
+                    ] );
+                }
+
+                abtestkit_pt_clear_last_duplicate_for_user( (int) $control_id, (int) get_current_user_id() );
+                update_option( 'abtestkit_onboarding_done', '1' );
+
+                return rest_ensure_response(
+                    [
+                        'ok'       => true,
+                        'test'     => $test,
+                        'redirect' => admin_url( 'admin.php?page=abtestkit-dashboard' ),
+                    ]
+                );
+            }
+
             // Shadow product approach: do NOT accept product_overrides from the wizard.
             // Variant B is edited directly on the shadow product, and parsing large payloads can OOM.
             $overrides = [];
@@ -2189,8 +2924,9 @@ register_rest_route(
                  * abtestkit_pt_stats_bulk() already performs one grouped stats query for
                  * all tests, so keeping this response live is acceptable and much clearer.
                  */
-                $out        = [];
-                $stats_bulk = abtestkit_pt_stats_bulk( $tests );
+                $out                  = [];
+                $stats_bulk           = abtestkit_pt_stats_bulk( $tests );
+                $http_exclusions_bulk = abtestkit_pt_http_exclusions_bulk( $tests );
 
                 foreach ( $tests as $test ) {
                     $test_id    = isset( $test['id'] ) ? (string) $test['id'] : '';
@@ -2222,7 +2958,7 @@ register_rest_route(
                         $base = get_permalink( $control_id );
                         $url  = $base;
 
-                        if ( $kind === 'custom_css' ) {
+                    if ( in_array( $kind, [ 'custom_css', 'custom_html' ], true ) ) {
                             $preview_a = add_query_arg(
                                 [
                                     'abtestkit_preview' => '1',
@@ -2273,12 +3009,16 @@ register_rest_route(
                         }
                     }
 
-                    $kind_label = ( $kind === 'custom_css' )
-                        ? 'Custom CSS'
+                    $kind_label = ( $kind === 'custom_html' )
+                        ? 'Custom HTML'
                         : (
-                            ( $kind === 'reusable_section' )
-                                ? 'Reusable Section'
-                                : ucfirst( str_replace( '_', ' ', $kind ) )
+                            ( $kind === 'custom_css' )
+                                ? 'Custom CSS'
+                                : (
+                                    ( $kind === 'reusable_section' )
+                                        ? 'Reusable Section'
+                                        : ucfirst( str_replace( '_', ' ', $kind ) )
+                                )
                         );
 
                     $custom_css_data = ( $kind === 'custom_css' )
@@ -2289,9 +3029,20 @@ register_rest_route(
                             'css_markers' => [],
                         ];
 
+                    $custom_html_data = ( $kind === 'custom_html' )
+                        ? abtestkit_custom_html_data_for_test( $test )
+                        : [
+                            'html_scope'   => '',
+                            'html_changes' => [],
+                        ];
+
                     $testing_title = $control_id > 0 ? get_the_title( $control_id ) : '';
-                    $test_stats    = $stats_bulk[ $test_id ] ?? abtestkit_pt_stats_default();
-                    $health        = abtestkit_pt_health_summary( $test, $test_stats );
+                    $test_stats            = $stats_bulk[ $test_id ] ?? abtestkit_pt_stats_default();
+                    $http_exclusion_context = $http_exclusions_bulk[ $test_id ] ?? [
+                        'http_excluded_count' => 0,
+                        'http_excluded_last'  => '',
+                    ];
+                    $health = abtestkit_pt_health_summary( $test, $test_stats, $http_exclusion_context );
 
                     $out[] = [
                         'id'              => isset( $test['id'] ) ? (string) $test['id'] : '',
@@ -2312,8 +3063,12 @@ register_rest_route(
                         'css_scope'       => $custom_css_data['css_scope'],
                         'custom_css'      => $custom_css_data['custom_css'],
                         'css_markers'     => $custom_css_data['css_markers'],
+                        'html_scope'       => $custom_html_data['html_scope'],
+                        'html_changes'     => $custom_html_data['html_changes'],
                         'stats'           => $test_stats,
                         'health'          => $health,
+                        'http_excluded_count' => (int) $http_exclusion_context['http_excluded_count'],
+                        'http_excluded_last'  => (string) $http_exclusion_context['http_excluded_last'],
                         'auto_paused_broken'    => ! empty( $test['auto_paused_broken'] ),
                         'auto_paused_broken_at' => isset( $test['auto_paused_broken_at'] ) ? (int) $test['auto_paused_broken_at'] : 0,
                         'url'             => $url,
@@ -2501,9 +3256,13 @@ register_rest_route(
                     $cached['test']['css_scope']             = $cached_custom_css_data['css_scope'];
                     $cached['test']['custom_css']            = $cached_custom_css_data['custom_css'];
                     $cached['test']['css_markers']           = $cached_custom_css_data['css_markers'];
+                    $cached_custom_html_data                 = abtestkit_custom_html_data_for_test( $test );
+                    $cached['test']['html_scope']             = $cached_custom_html_data['html_scope'];
+                    $cached['test']['html_changes']           = $cached_custom_html_data['html_changes'];
                     $cached['test']['status']                = isset( $test['status'] ) ? (string) $test['status'] : 'paused';
                     $cached['test']['auto_paused_broken']    = ! empty( $test['auto_paused_broken'] );
                     $cached['test']['auto_paused_broken_at'] = isset( $test['auto_paused_broken_at'] ) ? (int) $test['auto_paused_broken_at'] : 0;
+                    $cached['test']['engagement']            = abtestkit_pt_engagement_stats( $test_id );
 
                     $cached_stats = ( isset( $cached['test']['stats'] ) && is_array( $cached['test']['stats'] ) )
                         ? $cached['test']['stats']
@@ -2528,7 +3287,7 @@ register_rest_route(
                 if ( $control_id > 0 ) {
                     $base = get_permalink( $control_id );
 
-                    if ( $kind === 'custom_css' ) {
+                    if ( in_array( $kind, [ 'custom_css', 'custom_html' ], true ) ) {
                         $preview_a = add_query_arg(
                             [
                                 'abtestkit_preview' => '1',
@@ -2834,6 +3593,30 @@ register_rest_route(
                     );
                 }
 
+                /*
+                 * Health is independent of the selected chart range. Use the same
+                 * lifetime HTTP-exclusion aggregate as the dashboard so changing
+                 * Day/Week/Month cannot change a test's health status.
+                 */
+                $http_exclusions = abtestkit_pt_http_exclusions_bulk( [ $test ] );
+                $http_context    = $http_exclusions[ $test_id ] ?? [
+                    'http_excluded_count' => 0,
+                    'http_excluded_last'  => '',
+                ];
+
+                $http_excluded_count = (int) $http_context['http_excluded_count'];
+                $http_excluded_last  = (string) $http_context['http_excluded_last'];
+
+                if ( ! empty( $wpdb->last_error ) ) {
+                    return rest_ensure_response(
+                        [
+                            'ok'    => false,
+                            'error' => 'db_error',
+                            'debug' => $wpdb->last_error,
+                        ]
+                    );
+                }
+
                 $stats = abtestkit_pt_stats( $test );
 
                 if ( ! empty( $wpdb->last_error ) ) {
@@ -2853,12 +3636,16 @@ register_rest_route(
 
                 $click_targets = abtestkit_pt_click_targets_for_test( $test );
 
-                $kind_label = ( $kind === 'custom_css' )
-                    ? 'Custom CSS'
+                $kind_label = ( $kind === 'custom_html' )
+                    ? 'Custom HTML'
                     : (
-                        ( $kind === 'reusable_section' )
-                            ? 'Reusable Section'
-                            : ucfirst( str_replace( '_', ' ', $kind ) )
+                        ( $kind === 'custom_css' )
+                            ? 'Custom CSS'
+                            : (
+                                ( $kind === 'reusable_section' )
+                                    ? 'Reusable Section'
+                                    : ucfirst( str_replace( '_', ' ', $kind ) )
+                            )
                     );
 
                 $custom_css_data = ( $kind === 'custom_css' )
@@ -2867,6 +3654,13 @@ register_rest_route(
                         'css_scope'   => '',
                         'custom_css'  => '',
                         'css_markers' => [],
+                    ];
+
+                $custom_html_data = ( $kind === 'custom_html' )
+                    ? abtestkit_custom_html_data_for_test( $test )
+                    : [
+                        'html_scope'   => '',
+                        'html_changes' => [],
                     ];
 
                 $testing_title = $control_id > 0 ? get_the_title( $control_id ) : '';
@@ -2892,6 +3686,8 @@ register_rest_route(
                         'css_scope'           => $custom_css_data['css_scope'],
                         'custom_css'          => $custom_css_data['custom_css'],
                         'css_markers'         => $custom_css_data['css_markers'],
+                        'html_scope'           => $custom_html_data['html_scope'],
+                        'html_changes'         => $custom_html_data['html_changes'],
                         'decision_rule'       => isset( $test['decision_rule'] ) ? (string) $test['decision_rule'] : 'balanced',
                         'decision_mode'       => isset( $test['decision_mode'] ) ? (string) $test['decision_mode'] : 'auto',
                         'min_impressions'     => isset( $test['min_impressions'] ) ? (int) $test['min_impressions'] : 50,
@@ -2905,6 +3701,7 @@ register_rest_route(
                         'control_id'          => $control_id,
                         'variant_id'          => $variant_id,
                         'stats'               => $stats,
+                        'engagement'          => abtestkit_pt_engagement_stats( $test_id ),
                         'health'              => $health,
                         'auto_paused_broken'    => ! empty( $test['auto_paused_broken'] ),
                         'auto_paused_broken_at' => isset( $test['auto_paused_broken_at'] ) ? (int) $test['auto_paused_broken_at'] : 0,
@@ -3212,6 +4009,13 @@ register_rest_route(
                     );
                 }
 
+                if (
+                    $post_type === 'product'
+                    && function_exists( 'abtestkit_pt_sync_shadow_product_type' )
+                ) {
+                    abtestkit_pt_sync_shadow_product_type( (int) $control_id, (int) $variant_id );
+                }
+
                 $preview_url = '';
 
                 if ( $post_type !== 'product' ) {
@@ -3284,6 +4088,90 @@ function abtestkit_rest_permission( WP_REST_Request $request ) {
     return abtestkit_rest_check_nonce( $request ) && current_user_can( 'manage_options' );
 }
 
+function abtestkit_handle_html_runtime_health( WP_REST_Request $request ) {
+    if ( ! abtestkit_is_same_origin_request() && ! abtestkit_rest_check_nonce( $request ) ) {
+        return new WP_Error(
+            'abtestkit_html_health_forbidden',
+            __( 'This selector health report could not be verified.', 'abtestkit' ),
+            [ 'status' => 403 ]
+        );
+    }
+
+    $test_id    = abtestkit_sanitize_test_id( $request->get_param( 'test_id' ) );
+    $control_id = absint( $request->get_param( 'control_id' ) );
+    $test       = $test_id !== '' ? abtestkit_pt_get( $test_id ) : null;
+
+    if (
+        ! is_array( $test )
+        || ( $test['kind'] ?? '' ) !== 'custom_html'
+        || ( $test['status'] ?? '' ) !== 'running'
+        || (int) ( $test['control_id'] ?? 0 ) !== $control_id
+    ) {
+        return new WP_Error(
+            'abtestkit_html_health_test_not_found',
+            __( 'The running Custom HTML test could not be verified.', 'abtestkit' ),
+            [ 'status' => 404 ]
+        );
+    }
+
+    $changes = isset( $test['html_changes'] )
+        ? abtestkit_sanitize_custom_html_changes( $test['html_changes'] )
+        : [];
+    $total   = count( $changes );
+    $matched = max( 0, (int) $request->get_param( 'matched' ) );
+    $missing = max( 0, (int) $request->get_param( 'missing' ) );
+    $invalid = max( 0, (int) $request->get_param( 'invalid' ) );
+
+    if (
+        $total <= 0
+        || (int) $request->get_param( 'total' ) !== $total
+        || $matched + $missing + $invalid !== $total
+    ) {
+        return new WP_Error(
+            'abtestkit_html_health_invalid_counts',
+            __( 'The selector health counts did not match the saved test.', 'abtestkit' ),
+            [ 'status' => 400 ]
+        );
+    }
+
+    $minute_key = 'abtestkit_html_health_' . md5( $test_id . '|' . gmdate( 'YmdHi' ) );
+    $requests   = (int) get_transient( $minute_key );
+
+    if ( $requests >= 30 ) {
+        return new WP_Error(
+            'abtestkit_html_health_rate_limited',
+            __( 'Selector health is already up to date. Try again shortly.', 'abtestkit' ),
+            [ 'status' => 429 ]
+        );
+    }
+
+    set_transient( $minute_key, $requests + 1, 2 * MINUTE_IN_SECONDS );
+
+    $record = abtestkit_html_runtime_health_record(
+        $test,
+        [
+            'matched' => $matched,
+            'missing' => $missing,
+            'invalid' => $invalid,
+        ]
+    );
+
+    if ( empty( $record ) ) {
+        return new WP_Error(
+            'abtestkit_html_health_not_saved',
+            __( 'The selector health report could not be saved.', 'abtestkit' ),
+            [ 'status' => 400 ]
+        );
+    }
+
+    return rest_ensure_response(
+        [
+            'ok'     => true,
+            'status' => (string) $record['status'],
+        ]
+    );
+}
+
 /**
  * Register REST endpoints: /track, /stats, /evaluate, /reset.
  */
@@ -3294,6 +4182,12 @@ add_action('rest_api_init', function() {
         'permission_callback' => '__return_true',
         'callback'            => 'abtestkit_handle_track',
     ]);
+
+    register_rest_route( 'abtestkit/v1', '/pt/html-runtime-health', [
+        'methods'             => 'POST',
+        'permission_callback' => '__return_true',
+        'callback'            => 'abtestkit_handle_html_runtime_health',
+    ] );
 
     // Secure endpoints (require nonce+capability)
     foreach (['stats', 'evaluate', 'reset'] as $route) {
@@ -3315,8 +4209,10 @@ add_action('rest_api_init', function() {
             $detail     = sanitize_textarea_field( (string) $request->get_param( 'detail' ) );
             $detail_tag = sanitize_key( (string) $request->get_param( 'detail_tag' ) );
             $area       = sanitize_key( (string) $request->get_param( 'area' ) );
+            $wizard     = $request->get_param( 'wizard' );
+            $wizard     = is_array( $wizard ) ? $wizard : [];
 
-            abtestkit_telemetry_track_plugin_delete_reason( $reason, $detail, $detail_tag, $area );
+            abtestkit_telemetry_track_plugin_delete_reason( $reason, $detail, $detail_tag, $area, $wizard );
 
             return rest_ensure_response( [ 'ok' => true ] );
         },
@@ -3474,17 +4370,22 @@ function abtestkit_log_event_to_db( $type, $post_id, $ab_test_id, $variant, arra
     // keep IDs tight and types sane
     $ab_test_id = abtestkit_sanitize_test_id( $ab_test_id );
     $variant    = ( $variant === 'A' || $variant === 'B' ) ? $variant : '';
-    $allowed    = [ 'impression', 'click', 'purchase', 'decision', 'decision_applied', 'stale', 'protocol_warning' ];
+    $allowed    = [ 'impression', 'click', 'purchase', 'engagement', 'decision', 'decision_applied', 'stale', 'protocol_warning' ];
     $event_type = in_array( $type, $allowed, true ) ? $type : 'impression';
 
     // Privacy-safe storage: hash IP / UA so we keep light dedupe value without raw personal data.
-    $ip_raw = isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : '';
+    // Engagement aggregates do not need either value, so avoid storing them for those samples.
+    $ip_raw = $event_type !== 'engagement' && isset( $_SERVER['REMOTE_ADDR'] )
+        ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) )
+        : '';
     $ip     = '';
     if ( filter_var( $ip_raw, FILTER_VALIDATE_IP ) ) {
         $ip = substr( hash_hmac( 'sha256', $ip_raw, wp_salt( 'auth' ) ), 0, 32 );
     }
 
-    $ua_raw = isset( $_SERVER['HTTP_USER_AGENT'] ) ? sanitize_text_field( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ) ) : '';
+    $ua_raw = $event_type !== 'engagement' && isset( $_SERVER['HTTP_USER_AGENT'] )
+        ? sanitize_text_field( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ) )
+        : '';
     $ua     = '';
     if ( $ua_raw !== '' ) {
         $ua = substr( hash_hmac( 'sha256', $ua_raw, wp_salt( 'auth' ) ), 0, 32 );
@@ -3508,6 +4409,16 @@ function abtestkit_log_event_to_db( $type, $post_id, $ab_test_id, $variant, arra
     $excluded_reason = '';
     if ( isset( $extra['excluded_reason'] ) ) {
         $excluded_reason = sanitize_key( (string) $extra['excluded_reason'] );
+    }
+
+    $scroll_pct = 0;
+    if ( isset( $extra['scroll_pct'] ) && is_numeric( $extra['scroll_pct'] ) ) {
+        $scroll_pct = max( 0, min( 100, (int) round( (float) $extra['scroll_pct'] ) ) );
+    }
+
+    $time_sec = 0;
+    if ( isset( $extra['time_sec'] ) && is_numeric( $extra['time_sec'] ) ) {
+        $time_sec = max( 0, min( 3600, (int) round( (float) $extra['time_sec'] ) ) );
     }
 
     /*
@@ -3584,8 +4495,22 @@ function abtestkit_log_event_to_db( $type, $post_id, $ab_test_id, $variant, arra
         '%s', // user_agent
     ];
 
+    if ( $event_type === 'engagement' && abtestkit_events_table_has_column( 'scroll_pct' ) ) {
+        $data['scroll_pct'] = $scroll_pct;
+        $format[]           = '%d';
+    }
+
+    if ( $event_type === 'engagement' && abtestkit_events_table_has_column( 'time_sec' ) ) {
+        $data['time_sec'] = $time_sec;
+        $format[]         = '%d';
+    }
+
     // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.PreparedSQL.NotPrepared
     $wpdb->insert( ABTESTKIT_EVENTS_TABLE, $data, $format );
+
+    if ( $event_type === 'engagement' ) {
+        return;
+    }
 
     // Invalidate per-post/test stats cache so dashboard + performance reflect new rows.
     wp_cache_delete( "stats:$post_id:$ab_test_id", 'abtestkit_stats' );
@@ -4992,6 +5917,12 @@ function abtestkit_handle_track( WP_REST_Request $request ) {
     $ab_id           = abtestkit_sanitize_test_id( $body['abTestId'] ?? '' );
     $protocol        = sanitize_key( (string) ( $body['protocol'] ?? '' ) );
     $excluded_reason = sanitize_key( (string) ( $body['excluded_reason'] ?? '' ) );
+    $scroll_pct      = isset( $body['scroll'] ) && is_numeric( $body['scroll'] )
+        ? max( 0, min( 100, (int) round( (float) $body['scroll'] ) ) )
+        : 0;
+    $time_sec        = isset( $body['seconds'] ) && is_numeric( $body['seconds'] )
+        ? max( 0, min( 3600, (int) round( (float) $body['seconds'] ) ) )
+        : 0;
 
     // Public tracking must come from a real same-origin browser request.
     $nonce_ok  = abtestkit_rest_check_nonce( $request );
@@ -5004,8 +5935,8 @@ function abtestkit_handle_track( WP_REST_Request $request ) {
         ] );
     }
 
-    $valid_types   = [ 'impression', 'click', 'decision', 'decision_applied', 'stale', 'protocol_warning' ];
-    $needs_variant = in_array( $type, [ 'impression', 'click', 'decision', 'decision_applied', 'protocol_warning' ], true );
+    $valid_types   = [ 'impression', 'click', 'engagement', 'decision', 'decision_applied', 'stale', 'protocol_warning' ];
+    $needs_variant = in_array( $type, [ 'impression', 'click', 'engagement', 'decision', 'decision_applied', 'protocol_warning' ], true );
 
     if (
         empty( $ab_id ) ||
@@ -5136,7 +6067,9 @@ function abtestkit_handle_track( WP_REST_Request $request ) {
         $ab_id,
         $variant,
         [
-            'protocol' => 'https',
+            'protocol'   => 'https',
+            'scroll_pct' => $scroll_pct,
+            'time_sec'   => $time_sec,
         ]
     );
 
@@ -5245,26 +6178,23 @@ function abtestkit_handle_stats( WP_REST_Request $request ) {
             ARRAY_A
         );
     } else {
-        $ab_ids_csv = implode(
-            ',',
-            array_map(
-                static function( $id ) {
-                    return abtestkit_sanitize_test_id( $id );
-                },
-                $ab_ids
-            )
-        );
+        $ab_id_placeholders = implode( ', ', array_fill( 0, count( $ab_ids ), '%s' ) );
+        $query_args         = array_merge( [ $table, $post_id ], $ab_ids );
 
         // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
         $rows = $wpdb->get_results(
+            /*
+             * The fragment below contains generated %s tokens only. The argument
+             * array supplies the table, post ID and one value for every token.
+             */
+            // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
             $wpdb->prepare(
                 'SELECT ab_test_id, variant, event_type, COUNT(*) AS count ' .
                 'FROM %i ' .
-                'WHERE post_id = %d AND FIND_IN_SET(ab_test_id, %s) > 0 ' .
+                // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                'WHERE post_id = %d AND ab_test_id IN (' . $ab_id_placeholders . ') ' .
                 'GROUP BY ab_test_id, variant, event_type',
-                $table,
-                $post_id,
-                $ab_ids_csv
+                $query_args
             ),
             ARRAY_A
         );
@@ -6716,6 +7646,19 @@ function abtestkit_pt_all() : array {
         return [];
     }
 
+    /*
+     * Registry reads happen from frontend hooks, WooCommerce data stores and
+     * health checks. Never let a nested product/filter callback normalise the
+     * registry again while the outer read is still in progress.
+     */
+    static $normalising = false;
+
+    if ( $normalising ) {
+        return $tests;
+    }
+
+    $normalising = true;
+
     $changed = false;
 
     foreach ( $tests as &$t ) {
@@ -6857,6 +7800,8 @@ function abtestkit_pt_all() : array {
         update_option( ABTESTKIT_PAGE_TESTS_OPTION, $tests, false );
     }
 
+    $normalising = false;
+
     return $tests;
 }
 
@@ -6912,6 +7857,10 @@ function abtestkit_pt_delete( string $id ) {
 
     if ( is_array( $test ) && ! empty( $test['id'] ) ) {
         abtestkit_pt_flush_test_caches( (string) $test['id'] );
+    }
+
+    if ( function_exists( 'abtestkit_html_runtime_health_delete' ) ) {
+        abtestkit_html_runtime_health_delete( $id );
     }
 
     abtestkit_pt_save( $tests );
@@ -7460,6 +8409,128 @@ function abtestkit_regenerate_builder_assets( int $new_id, int $source_id = 0 ) 
     }
 }
 
+/**
+ * Keep a shadow product's canonical WooCommerce type identical to Version A.
+ *
+ * WooCommerce resolves a product class from the single `product_type` taxonomy
+ * term. A broad taxonomy clone is normally enough, but explicitly replacing and
+ * verifying this term prevents a newly inserted shadow from being read as the
+ * default simple type by either the classic or block-based product editor.
+ */
+function abtestkit_pt_sync_shadow_product_type( int $control_product_id, int $shadow_product_id ) : string {
+    if (
+        $control_product_id <= 0
+        || $shadow_product_id <= 0
+        || get_post_type( $control_product_id ) !== 'product'
+        || get_post_type( $shadow_product_id ) !== 'product'
+        || ! taxonomy_exists( 'product_type' )
+    ) {
+        return '';
+    }
+
+    $source_type = '';
+
+    if ( function_exists( 'wc_get_product' ) ) {
+        $control_product = wc_get_product( $control_product_id );
+
+        if ( $control_product instanceof WC_Product ) {
+            $source_type = sanitize_title( (string) $control_product->get_type() );
+        }
+    }
+
+    if ( $source_type === '' ) {
+        $source_types = wp_get_object_terms(
+            $control_product_id,
+            'product_type',
+            [ 'fields' => 'slugs' ]
+        );
+
+        if ( ! is_wp_error( $source_types ) && ! empty( $source_types ) ) {
+            $source_type = sanitize_title( (string) reset( $source_types ) );
+        }
+    }
+
+    if ( $source_type === '' || ! term_exists( $source_type, 'product_type' ) ) {
+        return '';
+    }
+
+    $shadow_types = wp_get_object_terms(
+        $shadow_product_id,
+        'product_type',
+        [ 'fields' => 'slugs' ]
+    );
+
+    $shadow_types = is_wp_error( $shadow_types )
+        ? []
+        : array_values( array_unique( array_map( 'sanitize_title', (array) $shadow_types ) ) );
+
+    if ( count( $shadow_types ) !== 1 || $shadow_types[0] !== $source_type ) {
+        $updated = wp_set_object_terms( $shadow_product_id, $source_type, 'product_type', false );
+
+        if ( is_wp_error( $updated ) ) {
+            return '';
+        }
+    }
+
+    clean_object_term_cache( $shadow_product_id, 'product' );
+    clean_post_cache( $shadow_product_id );
+
+    if ( function_exists( 'wc_delete_product_transients' ) ) {
+        wc_delete_product_transients( $shadow_product_id );
+    }
+
+    $verified_types = wp_get_object_terms(
+        $shadow_product_id,
+        'product_type',
+        [ 'fields' => 'slugs' ]
+    );
+
+    if (
+        is_wp_error( $verified_types )
+        || count( $verified_types ) !== 1
+        || sanitize_title( (string) reset( $verified_types ) ) !== $source_type
+    ) {
+        return '';
+    }
+
+    return $source_type;
+}
+
+/**
+ * Repair an already-created shadow before WooCommerce chooses its editor form.
+ *
+ * WooCommerce's beta editor redirects on `current_screen` at priority 30, so
+ * this runs earlier and leaves editor selection to WooCommerce itself.
+ */
+function abtestkit_pt_sync_shadow_product_type_before_edit( $screen ) : void {
+    if (
+        ! is_object( $screen )
+        || (string) ( $screen->base ?? '' ) !== 'post'
+        || (string) ( $screen->post_type ?? '' ) !== 'product'
+    ) {
+        return;
+    }
+
+    // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only routing values select an authorised product repair.
+    $post_id = isset( $_GET['post'] ) ? absint( wp_unslash( $_GET['post'] ) ) : 0;
+    // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only routing values select an authorised product repair.
+    $action = isset( $_GET['action'] ) ? sanitize_key( wp_unslash( $_GET['action'] ) ) : '';
+
+    if (
+        $post_id <= 0
+        || $action !== 'edit'
+        || ! current_user_can( 'edit_post', $post_id )
+        || ! function_exists( 'abtestkit_is_shadow_product' )
+        || ! abtestkit_is_shadow_product( $post_id )
+    ) {
+        return;
+    }
+
+    $control_product_id = (int) get_post_meta( $post_id, '_abtestkit_shadow_of', true );
+    abtestkit_pt_sync_shadow_product_type( $control_product_id, $post_id );
+}
+add_action( 'current_screen', 'abtestkit_pt_sync_shadow_product_type_before_edit', 5 );
+
 /** Duplicate a page or product (content + meta + taxonomies). */
 function abtestkit_duplicate_post_deep( int $post_id ) : int {
     $orig = get_post( $post_id );
@@ -7506,6 +8577,10 @@ function abtestkit_duplicate_post_deep( int $post_id ) : int {
         if ( ! is_wp_error( $terms ) && ! empty( $terms ) ) {
             wp_set_object_terms( $new_id, $terms, $tx, false );
         }
+    }
+
+    if ( $is_product ) {
+        abtestkit_pt_sync_shadow_product_type( (int) $post_id, (int) $new_id );
     }
 
     // Copy meta (FAST + low memory): do it in SQL (do not load all meta into PHP).
@@ -7654,6 +8729,54 @@ function abtestkit_clear_shadow_counts_cache( $type = null ) {
 function abtestkit_is_shadow_product( $post_id ) {
     return (int) get_post_meta( (int) $post_id, '_abtestkit_shadow', true ) === 1;
 }
+
+/**
+ * Keep non-catalog products out of Woodmart's adjacent-product query.
+ *
+ * Woodmart walks past invisible products after get_adjacent_post() returns
+ * them. Its date-only cursor can select the same invisible product forever,
+ * which eventually exhausts PHP's execution time. Excluding products that
+ * WooCommerce cannot show in the catalog also keeps abtestkit shadow products
+ * out of that loop without changing their stored visibility.
+ *
+ * @param string $where Adjacent-post query WHERE clause.
+ * @return string
+ */
+function abtestkit_woodmart_adjacent_product_where( $where ) {
+    global $post, $wpdb;
+
+    if (
+        ! class_exists( '\\XTS\\Modules\\WC_Adjacent_Products' )
+        || ! ( $post instanceof WP_Post )
+        || $post->post_type !== 'product'
+    ) {
+        return $where;
+    }
+
+    $where .= " AND NOT EXISTS (
+        SELECT 1
+        FROM {$wpdb->term_relationships} AS abtk_tr
+        INNER JOIN {$wpdb->term_taxonomy} AS abtk_tt
+            ON abtk_tt.term_taxonomy_id = abtk_tr.term_taxonomy_id
+        INNER JOIN {$wpdb->terms} AS abtk_t
+            ON abtk_t.term_id = abtk_tt.term_id
+        WHERE abtk_tr.object_id = p.ID
+            AND abtk_tt.taxonomy = 'product_visibility'
+            AND abtk_t.slug = 'exclude-from-catalog'
+    )";
+
+    $where .= " AND NOT EXISTS (
+        SELECT 1
+        FROM {$wpdb->postmeta} AS abtk_pm
+        WHERE abtk_pm.post_id = p.ID
+            AND abtk_pm.meta_key = '_abtestkit_shadow'
+            AND abtk_pm.meta_value = '1'
+    )";
+
+    return $where;
+}
+add_filter( 'get_previous_post_where', 'abtestkit_woodmart_adjacent_product_where', 20 );
+add_filter( 'get_next_post_where', 'abtestkit_woodmart_adjacent_product_where', 20 );
 
 function abtestkit_pt_get_product_test_control_id( $product ) : int {
     if ( $product instanceof WC_Product_Variation ) {
@@ -9533,6 +10656,13 @@ add_action( 'admin_post_abtestkit_pt_action', function () {
                     $test['auto_paused_broken_summary'],
                     $test['auto_paused_broken_checks']
                 );
+
+                if (
+                    ( $test['kind'] ?? '' ) === 'custom_html'
+                    && function_exists( 'abtestkit_html_runtime_health_delete' )
+                ) {
+                    abtestkit_html_runtime_health_delete( (string) $test['id'] );
+                }
             }
 
             abtestkit_pt_put( $test );
@@ -9567,8 +10697,8 @@ add_action( 'admin_post_abtestkit_pt_action', function () {
             /*
              * Normal in-plugin delete respects the UI choice.
              *
-             * Dashboard/performance only send trash_b=1 after the user confirms
-             * they also want Version B deleted.
+             * Dashboard/performance send trash_b=1 when their single delete
+             * confirmation explains that an abtestkit-owned Version B is included.
              *
              * Full automatic cleanup of ABTestKit-owned shadows is reserved for uninstall.
              */
@@ -9621,7 +10751,7 @@ add_action( 'admin_post_abtestkit_pt_action', function () {
             // Snapshot now (before we overwrite A / commit overrides / trash B).
             abtestkit_pt_snapshot_completed_test( $test );
 
-            if ( $kind === 'custom_css' ) {
+            if ( in_array( $kind, [ 'custom_css', 'custom_html' ], true ) ) {
                 $test['status']      = 'complete';
                 $test['winner']      = 'B';
                 $test['finished_at'] = time();
@@ -10224,6 +11354,78 @@ function abtestkit_pt_stats_default() : array {
     ];
 }
 
+function abtestkit_engagement_sample_rate() : float {
+    $rate = defined( 'ABTESTKIT_ENGAGEMENT_SAMPLE_RATE' )
+        ? (float) ABTESTKIT_ENGAGEMENT_SAMPLE_RATE
+        : 1.0;
+
+    return max( 0.0, min( 1.0, $rate ) );
+}
+
+function abtestkit_pt_engagement_stats( string $test_id ) : array {
+    global $wpdb;
+
+    $out = [
+        'sample_rate' => abtestkit_engagement_sample_rate(),
+        'A'           => [
+            'count'      => 0,
+            'avg_scroll' => 0.0,
+            'avg_time'   => 0.0,
+        ],
+        'B'           => [
+            'count'      => 0,
+            'avg_scroll' => 0.0,
+            'avg_time'   => 0.0,
+        ],
+    ];
+
+    $test_id = abtestkit_sanitize_test_id( $test_id );
+
+    if (
+        $test_id === ''
+        || ! abtestkit_events_table_has_column( 'scroll_pct' )
+        || ! abtestkit_events_table_has_column( 'time_sec' )
+    ) {
+        return $out;
+    }
+
+    // Read the small engagement aggregate only when an admin opens performance.
+    // Engagement events deliberately do not invalidate the larger conversion caches.
+    // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+    $rows = $wpdb->get_results(
+        $wpdb->prepare(
+            "SELECT
+                variant,
+                COUNT(*) AS sample_count,
+                AVG(scroll_pct) AS avg_scroll,
+                AVG(time_sec) AS avg_time
+             FROM %i
+             WHERE ab_test_id = %s
+               AND event_type = 'engagement'
+             GROUP BY variant",
+            ABTESTKIT_EVENTS_TABLE,
+            $test_id
+        ),
+        ARRAY_A
+    );
+
+    foreach ( (array) $rows as $row ) {
+        $variant = isset( $row['variant'] ) ? (string) $row['variant'] : '';
+
+        if ( ! isset( $out[ $variant ] ) ) {
+            continue;
+        }
+
+        $out[ $variant ] = [
+            'count'      => isset( $row['sample_count'] ) ? (int) $row['sample_count'] : 0,
+            'avg_scroll' => isset( $row['avg_scroll'] ) ? round( (float) $row['avg_scroll'], 1 ) : 0.0,
+            'avg_time'   => isset( $row['avg_time'] ) ? round( (float) $row['avg_time'], 1 ) : 0.0,
+        ];
+    }
+
+    return $out;
+}
+
 function abtestkit_pt_stats_cache_key( string $test_id ) : string {
     return 'abtestkit_pt_stats_' . md5( $test_id );
 }
@@ -10388,6 +11590,13 @@ function abtestkit_pt_health_summary( array $test, array $stats = [], array $con
     $preview_failure = function_exists( 'abtestkit_preview_health_latest_for_test' )
         ? abtestkit_preview_health_latest_for_test( $test )
         : [];
+    $html_runtime_health = (
+        $kind === 'custom_html'
+        && $test_id !== ''
+        && function_exists( 'abtestkit_html_runtime_health_get' )
+    )
+        ? abtestkit_html_runtime_health_get( $test_id )
+        : [];
 
     $stats = ( is_array( $stats ) && isset( $stats['A'], $stats['B'] ) ) ? $stats : abtestkit_pt_stats_default();
 
@@ -10482,6 +11691,70 @@ function abtestkit_pt_health_summary( array $test, array $stats = [], array $con
             $add_check( 'custom_css_markers', 'info', __( 'No B-only markers saved', 'abtestkit' ), __( 'This is fine if your CSS targets existing selectors directly.', 'abtestkit' ) );
         } else {
             $add_check( 'custom_css_markers', 'good', __( 'B-only markers are saved', 'abtestkit' ), __( 'Marker classes will be added to selected elements for Version B visitors only.', 'abtestkit' ) );
+        }
+    } elseif ( $kind === 'custom_html' ) {
+        $custom_html_data = abtestkit_custom_html_data_for_test( $test );
+
+        if ( empty( $custom_html_data['html_changes'] ) ) {
+            $add_check( 'custom_html_saved', 'broken', __( 'Version B HTML is missing', 'abtestkit' ), __( 'Custom HTML tests need at least one saved selector, operation and HTML change before they can show a difference.', 'abtestkit' ) );
+        } else {
+            $add_check( 'custom_html_saved', 'good', __( 'Version B HTML is saved', 'abtestkit' ), __( 'The selected targets, operations and Version B HTML are saved.', 'abtestkit' ) );
+        }
+
+        if ( ! empty( $custom_html_data['html_changes'] ) ) {
+            $runtime_status   = isset( $html_runtime_health['status'] ) ? sanitize_key( (string) $html_runtime_health['status'] ) : '';
+            $runtime_matched  = isset( $html_runtime_health['matched'] ) ? max( 0, (int) $html_runtime_health['matched'] ) : 0;
+            $runtime_missing  = isset( $html_runtime_health['missing'] ) ? max( 0, (int) $html_runtime_health['missing'] ) : 0;
+            $runtime_invalid  = isset( $html_runtime_health['invalid'] ) ? max( 0, (int) $html_runtime_health['invalid'] ) : 0;
+            $runtime_total    = isset( $html_runtime_health['total'] ) ? max( 0, (int) $html_runtime_health['total'] ) : 0;
+
+            if ( empty( $html_runtime_health ) ) {
+                $add_check(
+                    'custom_html_runtime',
+                    'info',
+                    __( 'Awaiting a live selector check', 'abtestkit' ),
+                    __( 'Aggregate selector health will appear after Version B is served on the live target page. Preview visits are not recorded.', 'abtestkit' )
+                );
+            } elseif ( $runtime_status === 'broken' ) {
+                $add_check(
+                    'custom_html_runtime',
+                    'broken',
+                    __( 'Live HTML targets are not reliable', 'abtestkit' ),
+                    sprintf(
+                        /* translators: 1: matched selector count, 2: total selector count, 3: missing selector count, 4: invalid selector count. */
+                        __( 'The latest confirmed checks matched %1$d of %2$d saved targets. Missing: %3$d. Invalid: %4$d. The report contains counts only, never selector text or visitor data.', 'abtestkit' ),
+                        $runtime_matched,
+                        $runtime_total,
+                        $runtime_missing,
+                        $runtime_invalid
+                    )
+                );
+            } elseif ( $runtime_status === 'attention' ) {
+                $add_check(
+                    'custom_html_runtime',
+                    'attention',
+                    __( 'Some live HTML targets need checking', 'abtestkit' ),
+                    sprintf(
+                        /* translators: 1: matched selector count, 2: total selector count, 3: missing selector count, 4: invalid selector count. */
+                        __( 'The latest live check matched %1$d of %2$d saved targets. Missing: %3$d. Invalid: %4$d. Missing targets stay in Needs attention because conditional or device-specific content can legitimately be absent; repeatedly confirmed invalid selector syntax can pause the test.', 'abtestkit' ),
+                        $runtime_matched,
+                        $runtime_total,
+                        $runtime_missing,
+                        $runtime_invalid
+                    )
+                );
+            } else {
+                $add_check(
+                    'custom_html_runtime',
+                    'good',
+                    __( 'Live HTML targets are matching', 'abtestkit' ),
+                    sprintf(
+                        /* translators: %d is the number of matched saved HTML targets. */
+                        __( 'The latest Version B check matched all %d saved targets.', 'abtestkit' ),
+                        $runtime_total
+                    )
+                );
+            }
         }
     } else {
         $variant_post = $variant_id > 0 ? get_post( $variant_id ) : null;
@@ -10660,6 +11933,84 @@ function abtestkit_pt_flush_test_caches( string $test_id ) : void {
     delete_transient( abtestkit_pt_performance_cache_key( $test_id, 'month' ) );
 }
 
+/**
+ * Return lifetime HTTP-exclusion health context for multiple tests in one query.
+ *
+ * @param array $tests Page-test records.
+ * @return array<string,array{http_excluded_count:int,http_excluded_last:string}>
+ */
+function abtestkit_pt_http_exclusions_bulk( array $tests ) : array {
+    global $wpdb;
+
+    $out      = [];
+    $test_ids = [];
+
+    foreach ( $tests as $test ) {
+        $test_id = is_array( $test ) && isset( $test['id'] )
+            ? abtestkit_sanitize_test_id( (string) $test['id'] )
+            : '';
+
+        if ( $test_id === '' ) {
+            continue;
+        }
+
+        $test_ids[]     = $test_id;
+        $out[ $test_id ] = [
+            'http_excluded_count' => 0,
+            'http_excluded_last'  => '',
+        ];
+    }
+
+    $test_ids = array_values( array_unique( $test_ids ) );
+
+    if (
+        empty( $test_ids )
+        || ! abtestkit_events_table_has_column( 'protocol' )
+        || ! abtestkit_events_table_has_column( 'excluded_reason' )
+    ) {
+        return $out;
+    }
+
+    $table        = ABTESTKIT_EVENTS_TABLE;
+    $placeholders = implode( ', ', array_fill( 0, count( $test_ids ), '%s' ) );
+    $query_args   = array_merge( [ $table ], $test_ids );
+
+    // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+    $rows = $wpdb->get_results(
+        /*
+         * The fragment below contains generated %s tokens only. The argument
+         * array supplies the table and one sanitized value for every token.
+         */
+        $wpdb->prepare(
+            'SELECT ab_test_id, COUNT(*) AS total, MAX(`time`) AS last_seen ' .
+            'FROM %i ' .
+            // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+            'WHERE ab_test_id IN (' . $placeholders . ') ' .
+            "AND event_type = 'protocol_warning' " .
+            "AND protocol = 'http' " .
+            "AND excluded_reason = 'http' " .
+            'GROUP BY ab_test_id',
+            $query_args
+        ),
+        ARRAY_A
+    );
+
+    foreach ( (array) $rows as $row ) {
+        $test_id = isset( $row['ab_test_id'] ) ? (string) $row['ab_test_id'] : '';
+
+        if ( $test_id === '' || ! isset( $out[ $test_id ] ) ) {
+            continue;
+        }
+
+        $out[ $test_id ] = [
+            'http_excluded_count' => isset( $row['total'] ) ? (int) $row['total'] : 0,
+            'http_excluded_last'  => isset( $row['last_seen'] ) ? (string) $row['last_seen'] : '',
+        ];
+    }
+
+    return $out;
+}
+
 function abtestkit_pt_stats_bulk( array $tests ) : array {
     global $wpdb;
 
@@ -10702,42 +12053,60 @@ function abtestkit_pt_stats_bulk( array $tests ) : array {
         return $out;
     }
 
-    $table = ABTESTKIT_EVENTS_TABLE;
-    $live_test_ids_csv = implode(
-        ',',
-        array_map(
-            static function( $test_id ) {
-                return abtestkit_sanitize_test_id( (string) $test_id );
-            },
-            $live_test_ids
+    $table         = ABTESTKIT_EVENTS_TABLE;
+    $live_test_ids = array_values(
+        array_unique(
+            array_filter(
+                array_map(
+                    static function( $test_id ) {
+                        return abtestkit_sanitize_test_id( (string) $test_id );
+                    },
+                    $live_test_ids
+                )
+            )
         )
     );
+
+    if ( empty( $live_test_ids ) ) {
+        return $out;
+    }
+
+    $live_test_id_placeholders = implode( ', ', array_fill( 0, count( $live_test_ids ), '%s' ) );
+    $query_args                 = array_merge( [ $table ], $live_test_ids );
 
     if ( abtestkit_events_table_has_column( 'amount' ) ) {
         // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
         $rows = $wpdb->get_results(
+            /*
+             * The fragment below contains generated %s tokens only. The argument
+             * array supplies the table and one sanitized value for every token.
+             */
             $wpdb->prepare(
                 'SELECT ab_test_id, variant, event_type, COUNT(*) AS c, COALESCE(SUM(amount), 0) AS revenue ' .
                 'FROM %i ' .
-                'WHERE FIND_IN_SET(ab_test_id, %s) > 0 ' .
+                // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                'WHERE ab_test_id IN (' . $live_test_id_placeholders . ') ' .
                 "AND event_type IN ('impression','click','purchase') " .
                 'GROUP BY ab_test_id, variant, event_type',
-                $table,
-                $live_test_ids_csv
+                $query_args
             ),
             ARRAY_A
         );
     } else {
         // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
         $rows = $wpdb->get_results(
+            /*
+             * The fragment below contains generated %s tokens only. The argument
+             * array supplies the table and one sanitized value for every token.
+             */
             $wpdb->prepare(
                 'SELECT ab_test_id, variant, event_type, COUNT(*) AS c, 0 AS revenue ' .
                 'FROM %i ' .
-                'WHERE FIND_IN_SET(ab_test_id, %s) > 0 ' .
+                // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+                'WHERE ab_test_id IN (' . $live_test_id_placeholders . ') ' .
                 "AND event_type IN ('impression','click','purchase') " .
                 'GROUP BY ab_test_id, variant, event_type',
-                $table,
-                $live_test_ids_csv
+                $query_args
             ),
             ARRAY_A
         );
@@ -11035,7 +12404,7 @@ if ( empty( $_GET['page'] ) || $_GET['page'] !== 'abtestkit-pt-wizard' ) {
         [ 'wp-element', 'wp-components', 'wp-api-fetch', 'wp-editor' ],
         file_exists( plugin_dir_path( __FILE__ ) . 'assets/js/pt-wizard.js' )
             ? filemtime( plugin_dir_path( __FILE__ ) . 'assets/js/pt-wizard.js' )
-            : ( defined( 'ABTESTKIT_VERSION' ) ? ABTESTKIT_VERSION : '1.5.0' ),
+            : ( defined( 'ABTESTKIT_VERSION' ) ? ABTESTKIT_VERSION : '1.5.1' ),
         true
     );
 
@@ -11060,7 +12429,7 @@ add_action( 'admin_enqueue_scripts', function ( $hook ) {
         'abtestkit-admin-list-guard',
         plugins_url( 'assets/js/admin-list-guard.js', __FILE__ ),
         [ 'jquery' ],
-        ( defined( 'ABTESTKIT_VERSION' ) ? ABTESTKIT_VERSION : '1.5.0' ),
+        ( defined( 'ABTESTKIT_VERSION' ) ? ABTESTKIT_VERSION : '1.5.1' ),
         true
     );
 
@@ -11202,6 +12571,40 @@ add_action( 'admin_enqueue_scripts', function( $hook ) {
     );
 } );
 
+/**
+ * Get defensive currency settings for revenue reporting.
+ *
+ * Revenue rows currently store amounts without a per-order currency, so the
+ * performance screen uses the site's current WooCommerce reporting currency.
+ * Keep the saved WooCommerce options useful when the plugin is temporarily
+ * inactive, then preserve the historical GBP fallback for non-WooCommerce
+ * installs.
+ *
+ * @return array{code:string,decimals:int}
+ */
+function abtestkit_reporting_currency_settings(): array {
+    $currency_code = function_exists( 'get_woocommerce_currency' )
+        ? (string) get_woocommerce_currency()
+        : (string) get_option( 'woocommerce_currency', 'GBP' );
+
+    $currency_code = strtoupper( sanitize_text_field( $currency_code ) );
+    $currency_code = preg_replace( '/[^A-Z0-9_-]/', '', $currency_code );
+    $currency_code = is_string( $currency_code ) ? substr( $currency_code, 0, 12 ) : '';
+
+    if ( $currency_code === '' ) {
+        $currency_code = 'GBP';
+    }
+
+    $decimals = function_exists( 'wc_get_price_decimals' )
+        ? (int) wc_get_price_decimals()
+        : (int) get_option( 'woocommerce_price_num_decimals', 2 );
+
+    return [
+        'code'     => $currency_code,
+        'decimals' => max( 0, min( 20, $decimals ) ),
+    ];
+}
+
 // Enqueue dashboard/performance admin apps
 add_action( 'admin_enqueue_scripts', function( $hook ) {
     $is_dashboard_page = (
@@ -11281,13 +12684,17 @@ add_action( 'admin_enqueue_scripts', function( $hook ) {
         }
         // phpcs:enable WordPress.Security.NonceVerification.Recommended
 
+        $currency_settings = abtestkit_reporting_currency_settings();
+
         wp_localize_script( 'abtestkit-test-performance', 'abtestkitTestPerformance', [
-            'nonce'        => wp_create_nonce( 'wp_rest' ),
-            'rest'         => esc_url_raw( rest_url( 'abtestkit/v1' ) ),
-            'testId'       => $performance_test_id,
-            'dashboardUrl' => admin_url( 'admin.php?page=abtestkit-dashboard' ),
-            'adminAction'  => admin_url( 'admin-post.php?action=abtestkit_pt_action' ),
-            'adminNonce'   => wp_create_nonce( 'abtestkit_pt_action' ),
+            'nonce'            => wp_create_nonce( 'wp_rest' ),
+            'rest'             => esc_url_raw( rest_url( 'abtestkit/v1' ) ),
+            'testId'           => $performance_test_id,
+            'dashboardUrl'     => admin_url( 'admin.php?page=abtestkit-dashboard' ),
+            'adminAction'      => admin_url( 'admin-post.php?action=abtestkit_pt_action' ),
+            'adminNonce'       => wp_create_nonce( 'abtestkit_pt_action' ),
+            'currencyCode'     => $currency_settings['code'],
+            'currencyDecimals' => $currency_settings['decimals'],
         ] );
     }
 } );
@@ -11750,7 +13157,7 @@ add_action( 'template_redirect', function () {
     ];
 
     $uses_single_url_shadow =
-        ( isset( $test['kind'] ) && (string) $test['kind'] === 'custom_css' )
+        ( isset( $test['kind'] ) && in_array( (string) $test['kind'], [ 'custom_css', 'custom_html' ], true ) )
         || $is_product_test
         || (
             in_array( $post_type, [ 'page', 'post' ], true )
@@ -11921,7 +13328,14 @@ add_action( 'wp_head', function () {
     echo "\n" . '</style>' . "\n";
 }, 999 );
 
-add_action( 'wp_footer', function () {
+/**
+ * Apply optional Version B marker classes before initial body paint.
+ *
+ * Direct Custom CSS already loads in wp_head. Marker-based rules also need
+ * their saved classes before the first rendered frame, then incremental
+ * reapplication when builders or AJAX replace the target later.
+ */
+add_action( 'wp_head', function () {
     $assignment = abtestkit_custom_css_current_assignment();
 
     if ( empty( $assignment ) ) {
@@ -11943,6 +13357,31 @@ add_action( 'wp_footer', function () {
       if (!Array.isArray(markers) || !markers.length) return;
 
       var markerApplyQueued = false;
+      var markerQueuedRoots = [];
+      var markerObserver = null;
+      var markerStopped = false;
+      var initialMarkerApplicationFinished = document.readyState !== 'loading';
+      var fallbackSelector = [
+        'h1',
+        'h2',
+        'h3',
+        'h4',
+        'h5',
+        'h6',
+        'a',
+        'button',
+        '[role="button"]',
+        '[role="tab"]',
+        '.title',
+        '.element-title',
+        '.slider-title',
+        '.section-title',
+        '.product_title',
+        '.related',
+        '.related-products',
+        '.upsells',
+        '.cross-sells'
+      ].join(',');
 
       function normaliseMarkerText(value) {
         return String(value || '')
@@ -11990,7 +13429,23 @@ add_action( 'wp_footer', function () {
         return false;
       }
 
-      function applyMarkerBySelector(marker) {
+      function elementsWithinRoot(root, selector) {
+        var elements = [];
+
+        if (root && root.nodeType === 1 && root.matches && root.matches(selector)) {
+          elements.push(root);
+        }
+
+        if (root && root.querySelectorAll) {
+          elements = elements.concat(Array.prototype.slice.call(root.querySelectorAll(selector)));
+        }
+
+        return elements.filter(function (element, index, allElements) {
+          return allElements.indexOf(element) === index;
+        });
+      }
+
+      function applyMarkerBySelector(marker, root) {
         var matched = 0;
 
         if (!marker || !marker.selector || !marker.class_name) {
@@ -11998,7 +13453,7 @@ add_action( 'wp_footer', function () {
         }
 
         try {
-          document.querySelectorAll(marker.selector).forEach(function (el) {
+          elementsWithinRoot(root, marker.selector).forEach(function (el) {
             if (addMarkerClass(el, marker.class_name)) {
               matched++;
             }
@@ -12008,7 +13463,7 @@ add_action( 'wp_footer', function () {
         return matched;
       }
 
-      function applyMarkerByLabelFallback(marker) {
+      function applyMarkerByLabelFallback(marker, root) {
         var label = labelFromMarker(marker);
 
         if (!label || !marker || !marker.class_name) {
@@ -12016,29 +13471,7 @@ add_action( 'wp_footer', function () {
         }
 
         var matched = 0;
-        var candidates = document.querySelectorAll(
-          [
-            'h1',
-            'h2',
-            'h3',
-            'h4',
-            'h5',
-            'h6',
-            'a',
-            'button',
-            '[role="button"]',
-            '[role="tab"]',
-            '.title',
-            '.element-title',
-            '.slider-title',
-            '.section-title',
-            '.product_title',
-            '.related',
-            '.related-products',
-            '.upsells',
-            '.cross-sells'
-          ].join(',')
-        );
+        var candidates = elementsWithinRoot(root, fallbackSelector);
 
         candidates.forEach(function (el) {
           if (matched > 0 || !isUsableFallbackElement(el)) {
@@ -12057,57 +13490,884 @@ add_action( 'wp_footer', function () {
         return matched;
       }
 
-      function applyMarkers() {
+      function applyMarkers(root) {
+        root = root && root.querySelectorAll ? root : document;
+
         markers.forEach(function (marker) {
           if (!marker || !marker.class_name) return;
 
-          var matched = applyMarkerBySelector(marker);
+          var matched = applyMarkerBySelector(marker, root);
 
           if (!matched) {
-            applyMarkerByLabelFallback(marker);
+            applyMarkerByLabelFallback(marker, root);
           }
         });
       }
 
-      function scheduleMarkerApply() {
+      function markerRootContains(parent, child) {
+        if (parent === document) return true;
+        return !!(parent && child && parent.contains && parent.contains(child));
+      }
+
+      function scheduleMarkerApply(root) {
+        if (markerStopped) return;
+
+        root = root && root.querySelectorAll ? root : document;
+
+        if (root === document || markerQueuedRoots.length >= 50) {
+          markerQueuedRoots = [document];
+        } else {
+          if (markerQueuedRoots.some(function (queuedRoot) {
+            return markerRootContains(queuedRoot, root);
+          })) {
+            return;
+          }
+
+          markerQueuedRoots = markerQueuedRoots.filter(function (queuedRoot) {
+            return !markerRootContains(root, queuedRoot);
+          });
+          markerQueuedRoots.push(root);
+        }
+
         if (markerApplyQueued) return;
 
         markerApplyQueued = true;
 
         window.requestAnimationFrame(function () {
+          if (markerStopped) return;
+
+          var roots = markerQueuedRoots.slice();
+          markerQueuedRoots = [];
           markerApplyQueued = false;
-          applyMarkers();
+
+          roots.forEach(applyMarkers);
         });
       }
 
-      if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', scheduleMarkerApply, { once: true });
-      } else {
-        scheduleMarkerApply();
+      function finishInitialMarkerApplication() {
+        if (markerStopped) return;
+
+        applyMarkers(document);
+        initialMarkerApplicationFinished = true;
       }
 
-      window.addEventListener('load', scheduleMarkerApply, { once: true });
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', finishInitialMarkerApplication, { once: true });
+      } else {
+        finishInitialMarkerApplication();
+      }
+
+      window.addEventListener('load', function () {
+        scheduleMarkerApply(document);
+      }, { once: true });
 
       [100, 500, 1200, 2500].forEach(function (delay) {
-        window.setTimeout(scheduleMarkerApply, delay);
+        window.setTimeout(function () {
+          scheduleMarkerApply(document);
+        }, delay);
       });
 
       if (window.MutationObserver && document.documentElement) {
-        var observer = new MutationObserver(scheduleMarkerApply);
+        markerObserver = new MutationObserver(function (records) {
+          records.forEach(function (record) {
+            Array.prototype.forEach.call(record.addedNodes || [], function (node) {
+              var root = node && node.nodeType === 1
+                ? node
+                : (node && node.parentElement ? node.parentElement : null);
+
+              if (!root) return;
+
+              if (initialMarkerApplicationFinished) {
+                scheduleMarkerApply(root);
+              } else {
+                applyMarkers(root);
+              }
+            });
+          });
+        });
+
+        markerObserver.observe(document.documentElement, {
+          childList: true,
+          subtree: true
+        });
+      }
+
+      window.addEventListener('pagehide', function () {
+        markerStopped = true;
+        markerQueuedRoots = [];
+
+        if (markerObserver) {
+          markerObserver.disconnect();
+        }
+      }, { once: true });
+    })();
+    </script>
+    <?php
+}, 2 );
+
+if ( ! function_exists( 'abtestkit_custom_html_preview_assignment' ) ) {
+    function abtestkit_custom_html_preview_assignment() : array {
+        if ( is_admin() || ! current_user_can( 'manage_options' ) ) {
+            return [];
+        }
+
+        // phpcs:disable WordPress.Security.NonceVerification.Recommended -- read-only preview token; ownership is checked against the current admin user.
+        $preview_flag = isset( $_GET['abtestkit_preview'] )
+            ? sanitize_text_field( wp_unslash( (string) $_GET['abtestkit_preview'] ) )
+            : '';
+
+        $token = isset( $_GET['abtestkit_custom_html_preview'] )
+            ? sanitize_text_field( wp_unslash( (string) $_GET['abtestkit_custom_html_preview'] ) )
+            : '';
+        // phpcs:enable WordPress.Security.NonceVerification.Recommended
+
+        if ( $preview_flag !== '1' || $token === '' ) {
+            return [];
+        }
+
+        $data = get_transient( 'abtestkit_custom_html_preview_' . $token );
+
+        if ( ! is_array( $data ) ) {
+            return [];
+        }
+
+        $user_id = isset( $data['user_id'] ) ? (int) $data['user_id'] : 0;
+        if ( $user_id <= 0 || $user_id !== (int) get_current_user_id() ) {
+            return [];
+        }
+
+        $control_id = isset( $data['control_id'] ) ? absint( $data['control_id'] ) : 0;
+        if ( $control_id <= 0 ) {
+            return [];
+        }
+
+        $current_id = (int) get_queried_object_id();
+        if ( $current_id > 0 && $current_id !== $control_id ) {
+            return [];
+        }
+
+        $html_changes = isset( $data['html_changes'] )
+            ? abtestkit_sanitize_custom_html_changes( $data['html_changes'] )
+            : [];
+
+        if ( empty( $html_changes ) ) {
+            return [];
+        }
+
+        return [
+            'ctx'  => [
+                'variant' => 'B',
+                'preview' => 1,
+            ],
+            'test' => [
+                'id'         => 'preview-' . substr( md5( $token ), 0, 12 ),
+                'kind'       => 'custom_html',
+                'control_id' => $control_id,
+            ],
+            'data' => [
+                'html_scope'   => isset( $data['post_type'] ) ? sanitize_key( (string) $data['post_type'] ) : '',
+                'html_changes' => $html_changes,
+            ],
+        ];
+    }
+}
+
+if ( ! function_exists( 'abtestkit_custom_html_current_assignment' ) ) {
+    function abtestkit_custom_html_current_assignment() : array {
+        $preview_assignment = abtestkit_custom_html_preview_assignment();
+
+        if ( ! empty( $preview_assignment ) ) {
+            return $preview_assignment;
+        }
+
+        $ctx = isset( $GLOBALS['abtestkit_current_pt_assignment'] ) && is_array( $GLOBALS['abtestkit_current_pt_assignment'] )
+            ? $GLOBALS['abtestkit_current_pt_assignment']
+            : [];
+
+        $test = isset( $ctx['test'] ) && is_array( $ctx['test'] ) ? $ctx['test'] : [];
+
+        if ( empty( $test['id'] ) || ( $test['kind'] ?? '' ) !== 'custom_html' ) {
+            return [];
+        }
+
+        if ( ( $ctx['variant'] ?? '' ) !== 'B' ) {
+            return [];
+        }
+
+        return [
+            'ctx'  => $ctx,
+            'test' => $test,
+            'data' => abtestkit_custom_html_data_for_test( $test ),
+        ];
+    }
+}
+
+add_filter( 'body_class', function ( $classes ) {
+    $assignment = abtestkit_custom_html_current_assignment();
+
+    if ( empty( $assignment ) ) {
+        return $classes;
+    }
+
+    $classes[] = 'abtestkit-custom-html-b';
+
+    $test_id = isset( $assignment['test']['id'] ) ? sanitize_html_class( (string) $assignment['test']['id'] ) : '';
+    if ( $test_id !== '' ) {
+        $classes[] = 'abtestkit-custom-html-b-' . $test_id;
+    }
+
+    return array_values( array_unique( array_filter( $classes ) ) );
+} );
+
+/**
+ * Hide Custom HTML targets only while Version B is being applied.
+ *
+ * The selector text is evaluated by querySelectorAll() rather than emitted as
+ * CSS. This keeps malformed selectors isolated and prevents one bad selector
+ * from invalidating the complete anti-flicker layer. The timeout is deliberately
+ * short and fail-open so a runtime or third-party JavaScript error can never
+ * leave live content hidden.
+ */
+add_action( 'wp_head', function () {
+    $assignment = abtestkit_custom_html_current_assignment();
+
+    if ( empty( $assignment ) ) {
+        return;
+    }
+
+    $changes = isset( $assignment['data']['html_changes'] ) && is_array( $assignment['data']['html_changes'] )
+        ? $assignment['data']['html_changes']
+        : [];
+
+    if ( empty( $changes ) ) {
+        return;
+    }
+
+    $selector_configs = [];
+
+    foreach ( $changes as $change ) {
+        $selector = isset( $change['selector'] ) ? trim( (string) $change['selector'] ) : '';
+
+        if ( $selector === '' ) {
+            continue;
+        }
+
+        $selector_configs[] = [
+            'selector'   => $selector,
+            'match_mode' => ( ( $change['match_mode'] ?? 'all' ) === 'first' ) ? 'first' : 'all',
+        ];
+    }
+
+    if ( empty( $selector_configs ) ) {
+        return;
+    }
+
+    $test_id = isset( $assignment['test']['id'] )
+        ? sanitize_html_class( (string) $assignment['test']['id'] )
+        : 'custom-html';
+
+    $safe_test_id      = preg_replace( '/[^a-zA-Z0-9_-]/', '', $test_id );
+    $pending_attribute = 'data-abtestkit-html-' . ( $safe_test_id ?: 'custom-html' ) . '-pending';
+    ?>
+    <style id="abtestkit-custom-html-antiflicker-<?php echo esc_attr( $test_id ); ?>">
+    [<?php echo esc_attr( $pending_attribute ); ?>="1"] { visibility: hidden !important; }
+    </style>
+    <script id="abtestkit-custom-html-antiflicker-loader-<?php echo esc_attr( $test_id ); ?>">
+    (function () {
+      var configs = <?php echo wp_json_encode( array_values( $selector_configs ) ); ?>;
+      var pendingAttribute = <?php echo wp_json_encode( $pending_attribute ); ?>;
+      var styleId = <?php echo wp_json_encode( 'abtestkit-custom-html-antiflicker-' . $test_id ); ?>;
+      var observer = null;
+      var finished = false;
+
+      if (!Array.isArray(configs) || !configs.length || !pendingAttribute) return;
+
+      configs = configs.map(function (config) {
+        return {
+          selector: String((config && config.selector) || ''),
+          matchMode: String((config && config.match_mode) || 'all') === 'first' ? 'first' : 'all',
+          matched: false
+        };
+      });
+
+      function markElement(element, config) {
+        if (!element || !element.setAttribute || (config.matchMode === 'first' && config.matched)) {
+          return;
+        }
+
+        element.setAttribute(pendingAttribute, '1');
+        config.matched = true;
+      }
+
+      function markWithin(root) {
+        if (finished || !root) return;
+
+        configs.forEach(function (config) {
+          if (!config.selector || (config.matchMode === 'first' && config.matched)) return;
+
+          try {
+            if (root.nodeType === 1 && root.matches && root.matches(config.selector)) {
+              markElement(root, config);
+            }
+
+            if (config.matchMode === 'first' && config.matched) return;
+            if (!root.querySelectorAll) return;
+
+            var matches = root.querySelectorAll(config.selector);
+            var limit = config.matchMode === 'first' ? Math.min(matches.length, 1) : matches.length;
+
+            for (var index = 0; index < limit; index++) {
+              markElement(matches[index], config);
+            }
+          } catch (e) {}
+        });
+      }
+
+      function cleanup() {
+        if (finished) return;
+        finished = true;
+
+        if (observer) {
+          observer.disconnect();
+        }
+
+        try {
+          document.querySelectorAll('[' + pendingAttribute + ']').forEach(function (element) {
+            element.removeAttribute(pendingAttribute);
+          });
+        } catch (e) {}
+
+        var style = document.getElementById(styleId);
+        if (style && style.parentNode) {
+          style.parentNode.removeChild(style);
+        }
+      }
+
+      markWithin(document);
+
+      if (window.MutationObserver && document.documentElement) {
+        observer = new MutationObserver(function (records) {
+          records.forEach(function (record) {
+            Array.prototype.forEach.call(record.addedNodes || [], markWithin);
+          });
+        });
 
         observer.observe(document.documentElement, {
           childList: true,
           subtree: true
         });
-
-        window.setTimeout(function () {
-          observer.disconnect();
-        }, 8000);
       }
+
+      window.setTimeout(cleanup, 3000);
     })();
     </script>
     <?php
-}, 20 );
+}, 1 );
+
+add_action( 'wp_head', function () {
+    $assignment = abtestkit_custom_html_current_assignment();
+
+    if ( empty( $assignment ) ) {
+        return;
+    }
+
+    $changes = isset( $assignment['data']['html_changes'] ) && is_array( $assignment['data']['html_changes'] )
+        ? $assignment['data']['html_changes']
+        : [];
+
+    if ( empty( $changes ) ) {
+        return;
+    }
+
+    $test_id = isset( $assignment['test']['id'] )
+        ? sanitize_html_class( (string) $assignment['test']['id'] )
+        : 'custom-html';
+    $control_id = isset( $assignment['test']['control_id'] )
+        ? absint( $assignment['test']['control_id'] )
+        : 0;
+    $health_reporting_enabled = (
+        empty( $assignment['ctx']['preview'] )
+        && ( $assignment['test']['status'] ?? '' ) === 'running'
+        && strpos( $test_id, 'pt-' ) === 0
+        && $control_id > 0
+    );
+    $health_endpoint = $health_reporting_enabled
+        ? rest_url( 'abtestkit/v1/pt/html-runtime-health' )
+        : '';
+    ?>
+    <script id="abtestkit-custom-html-<?php echo esc_attr( $test_id ); ?>">
+    (function () {
+      var changes = <?php echo wp_json_encode( $changes ); ?>;
+      if (!Array.isArray(changes) || !changes.length) return;
+
+      var applyQueued = false;
+      var queuedRoots = [];
+      var observer = null;
+      var stopped = false;
+      var initialApplicationFinished = document.readyState !== 'loading';
+      var healthTimer = null;
+      var lastHealthCheckAt = 0;
+      var lastHealthSignature = '';
+      var testId = <?php echo wp_json_encode( $test_id ); ?>;
+      var controlId = <?php echo (int) $control_id; ?>;
+      var healthEndpoint = <?php echo wp_json_encode( $health_endpoint ); ?>;
+      var healthReportingEnabled = <?php echo $health_reporting_enabled ? 'true' : 'false'; ?>;
+      var markerAttribute = 'data-abtestkit-html-' + String(testId || 'custom-html').replace(/[^a-zA-Z0-9_-]/g, '');
+      var insertedAttribute = markerAttribute + '-inserted';
+      var pendingAttribute = markerAttribute + '-pending';
+      var appliedStates = typeof WeakMap === 'function' ? new WeakMap() : null;
+      var fallbackStateKey = '__abtestkitHtmlState' + String(testId || 'customHtml').replace(/[^a-zA-Z0-9_$]/g, '');
+
+      function getAppliedStates(element) {
+        if (appliedStates) {
+          return appliedStates.get(element) || null;
+        }
+
+        return element && element[fallbackStateKey] ? element[fallbackStateKey] : null;
+      }
+
+      function getAppliedState(element, changeKey) {
+        var states = getAppliedStates(element);
+        return states && states[changeKey] ? states[changeKey] : null;
+      }
+
+      function setAppliedState(element, changeKey, state) {
+        var states = getAppliedStates(element) || {};
+        states[changeKey] = state;
+
+        if (appliedStates) {
+          appliedStates.set(element, states);
+          return;
+        }
+
+        try {
+          element[fallbackStateKey] = states;
+        } catch (e) {}
+      }
+
+      function normaliseOperation(value) {
+        var operation = String(value || 'replace_contents');
+        return [
+          'replace_contents',
+          'insert_before',
+          'insert_after',
+          'prepend_inside',
+          'append_inside'
+        ].indexOf(operation) !== -1 ? operation : 'replace_contents';
+      }
+
+      function createInsertionFragment(html) {
+        var fragment = document.createDocumentFragment();
+        var start = document.createComment('abtestkit-html-start');
+        var end = document.createComment('abtestkit-html-end');
+        var template = document.createElement('template');
+
+        fragment.appendChild(start);
+        template.innerHTML = html;
+
+        if (template.content) {
+          while (template.content.firstChild) {
+            fragment.appendChild(template.content.firstChild);
+          }
+        } else {
+          var container = document.createElement('div');
+          container.innerHTML = html;
+          while (container.firstChild) {
+            fragment.appendChild(container.firstChild);
+          }
+        }
+
+        Array.prototype.slice.call(fragment.childNodes).forEach(function (node) {
+          if (node && node.nodeType === 1 && node.setAttribute) {
+            node.setAttribute(insertedAttribute, '1');
+          }
+        });
+
+        fragment.appendChild(end);
+
+        return {
+          fragment: fragment,
+          start: start,
+          end: end
+        };
+      }
+
+      function insertionIsConnected(state) {
+        return !!(
+          state &&
+          state.start &&
+          state.end &&
+          state.start.isConnected &&
+          state.end.isConnected &&
+          state.start.parentNode === state.end.parentNode
+        );
+      }
+
+      function applyChangeToElement(element, change, operation, changeKey) {
+        if (!element) return false;
+
+        var previousState = getAppliedState(element, changeKey);
+
+        if (
+          operation === 'replace_contents' &&
+          previousState &&
+          previousState.operation === operation &&
+          previousState.value === element.innerHTML
+        ) {
+          element.removeAttribute(pendingAttribute);
+          return false;
+        }
+
+        if (
+          operation !== 'replace_contents' &&
+          previousState &&
+          previousState.operation === operation &&
+          insertionIsConnected(previousState)
+        ) {
+          element.removeAttribute(pendingAttribute);
+          return false;
+        }
+
+        if (operation === 'replace_contents') {
+          element.innerHTML = change.html;
+
+          setAppliedState(element, changeKey, {
+            operation: operation,
+            value: element.innerHTML
+          });
+        } else {
+          var insertion = createInsertionFragment(change.html);
+
+          if (operation === 'insert_before') {
+            if (!element.parentNode) return false;
+            element.parentNode.insertBefore(insertion.fragment, element);
+          } else if (operation === 'insert_after') {
+            if (!element.parentNode) return false;
+            element.parentNode.insertBefore(insertion.fragment, element.nextSibling);
+          } else if (operation === 'prepend_inside') {
+            element.insertBefore(insertion.fragment, element.firstChild);
+          } else {
+            element.appendChild(insertion.fragment);
+          }
+
+          setAppliedState(element, changeKey, {
+            operation: operation,
+            start: insertion.start,
+            end: insertion.end
+          });
+        }
+
+        element.setAttribute(markerAttribute, '1');
+        element.removeAttribute(pendingAttribute);
+        return true;
+      }
+
+      function elementIsInsideInsertedContent(element) {
+        var insideInsertedContent = !!(
+          element &&
+          element.closest &&
+          element.closest('[' + insertedAttribute + ']')
+        );
+
+        if (insideInsertedContent && element.removeAttribute) {
+          element.removeAttribute(pendingAttribute);
+        }
+
+        return insideInsertedContent;
+      }
+
+      function elementsForChange(change, matchMode, root) {
+        var elements = [];
+
+        if (matchMode === 'first') {
+          var first = document.querySelector(change.selector);
+          return first && !elementIsInsideInsertedContent(first) ? [first] : [];
+        }
+
+        if (root && root.nodeType === 1 && root.matches && root.matches(change.selector)) {
+          elements.push(root);
+        }
+
+        if (root && root.querySelectorAll) {
+          elements = elements.concat(Array.prototype.slice.call(root.querySelectorAll(change.selector)));
+        }
+
+        return elements.filter(function (element, index, allElements) {
+          return allElements.indexOf(element) === index && !elementIsInsideInsertedContent(element);
+        });
+      }
+
+      function applyChanges(root) {
+        var replacementStates = [];
+        root = root && root.querySelectorAll ? root : document;
+
+        changes.forEach(function (change, changeIndex) {
+          if (!change || !change.selector || typeof change.html !== 'string') return;
+
+          var elements = [];
+          var operation = normaliseOperation(change.operation);
+          var matchMode = String(change.match_mode || 'all') === 'first' ? 'first' : 'all';
+          var changeKey = 'change-' + String(changeIndex);
+
+          try {
+            elements = elementsForChange(change, matchMode, root);
+          } catch (e) {
+            return;
+          }
+
+          elements.forEach(function (element) {
+            var didApply = applyChangeToElement(element, change, operation, changeKey);
+
+            if (operation === 'replace_contents') {
+              replacementStates.push({ element: element, changeKey: changeKey });
+            }
+
+            if (!didApply) return;
+
+            try {
+              element.dispatchEvent(new CustomEvent('abtestkit:html-applied', {
+                bubbles: true,
+                detail: {
+                  selector: change.selector,
+                  operation: operation,
+                  matchMode: matchMode,
+                  testId: testId
+                }
+              }));
+            } catch (e) {}
+          });
+        });
+
+        replacementStates.forEach(function (item) {
+          var state = getAppliedState(item.element, item.changeKey);
+
+          if (!state || state.operation !== 'replace_contents') return;
+
+          state.value = item.element.innerHTML;
+          setAppliedState(item.element, item.changeKey, state);
+        });
+      }
+
+      function rootContains(parent, child) {
+        if (parent === document) return true;
+        return !!(parent && child && parent.contains && parent.contains(child));
+      }
+
+      function queueRoot(root) {
+        if (stopped || !root || (root.nodeType !== 1 && root !== document)) return;
+
+        if (root === document || queuedRoots.length >= 50) {
+          queuedRoots = [document];
+        } else {
+          if (queuedRoots.some(function (queuedRoot) {
+            return rootContains(queuedRoot, root);
+          })) {
+            return;
+          }
+
+          queuedRoots = queuedRoots.filter(function (queuedRoot) {
+            return !rootContains(root, queuedRoot);
+          });
+          queuedRoots.push(root);
+        }
+
+        if (applyQueued) return;
+        applyQueued = true;
+
+        window.requestAnimationFrame(function () {
+          if (stopped) return;
+
+          var roots = queuedRoots.slice();
+          queuedRoots = [];
+          applyQueued = false;
+
+          roots.forEach(applyChanges);
+        });
+      }
+
+      function scheduleApply() {
+        queueRoot(document);
+      }
+
+      function collectHealthCounts() {
+        var counts = {
+          matched: 0,
+          missing: 0,
+          invalid: 0,
+          total: changes.length
+        };
+
+        changes.forEach(function (change) {
+          if (!change || !change.selector || typeof change.html !== 'string') {
+            counts.invalid += 1;
+            return;
+          }
+
+          try {
+            var elements = Array.prototype.slice.call(document.querySelectorAll(change.selector)).filter(function (element) {
+              return !elementIsInsideInsertedContent(element);
+            });
+
+            if (elements.length) {
+              counts.matched += 1;
+            } else {
+              counts.missing += 1;
+            }
+          } catch (e) {
+            counts.invalid += 1;
+          }
+        });
+
+        return counts;
+      }
+
+      function reportHealth() {
+        healthTimer = null;
+        lastHealthCheckAt = Date.now();
+
+        if (!healthReportingEnabled || !healthEndpoint || !window.fetch || stopped) return;
+
+        var counts = collectHealthCounts();
+        var signature = [
+          counts.matched,
+          counts.missing,
+          counts.invalid,
+          counts.total
+        ].join(':');
+
+        if (signature === lastHealthSignature) return;
+
+        var storageKey = 'abtestkitHtmlHealth:' + testId + ':' + String(controlId);
+
+        try {
+          var previous = JSON.parse(window.sessionStorage.getItem(storageKey) || '{}');
+          if (
+            previous &&
+            previous.signature === signature &&
+            Number(previous.savedAt || 0) > Date.now() - (15 * 60 * 1000)
+          ) {
+            lastHealthSignature = signature;
+            return;
+          }
+        } catch (e) {}
+
+        window.fetch(healthEndpoint, {
+          method: 'POST',
+          credentials: 'same-origin',
+          keepalive: true,
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            test_id: testId,
+            control_id: controlId,
+            matched: counts.matched,
+            missing: counts.missing,
+            invalid: counts.invalid,
+            total: counts.total
+          })
+        }).then(function (response) {
+          if (!response.ok) {
+            scheduleHealthCheck(30000);
+            return;
+          }
+
+          lastHealthSignature = signature;
+          try {
+            window.sessionStorage.setItem(storageKey, JSON.stringify({
+              signature: signature,
+              savedAt: Date.now()
+            }));
+          } catch (e) {}
+        }).catch(function () {
+          scheduleHealthCheck(30000);
+        });
+      }
+
+      function scheduleHealthCheck(delay) {
+        if (!healthReportingEnabled || stopped || healthTimer) return;
+
+        var wait = Math.max(0, Number(delay || 0));
+        if (lastHealthCheckAt > 0) {
+          wait = Math.max(wait, 30000 - (Date.now() - lastHealthCheckAt));
+        }
+
+        healthTimer = window.setTimeout(reportHealth, wait);
+      }
+
+      function finishInitialApplication() {
+        if (stopped) return;
+
+        applyChanges(document);
+        initialApplicationFinished = true;
+        scheduleHealthCheck(3000);
+      }
+
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', finishInitialApplication, { once: true });
+      } else {
+        finishInitialApplication();
+      }
+
+      window.addEventListener('load', scheduleApply, { once: true });
+
+      [100, 500, 1200, 2500].forEach(function (delay) {
+        window.setTimeout(scheduleApply, delay);
+      });
+
+      function scheduleAfterInteraction() {
+        window.setTimeout(scheduleApply, 0);
+        window.setTimeout(scheduleApply, 150);
+      }
+
+      document.addEventListener('click', scheduleAfterInteraction, true);
+      document.addEventListener('focusin', scheduleAfterInteraction, true);
+      document.addEventListener('abtestkit:refresh-html', scheduleApply, true);
+      window.addEventListener('popstate', scheduleApply);
+      window.addEventListener('hashchange', scheduleApply);
+
+      if (window.MutationObserver && document.documentElement) {
+        observer = new MutationObserver(function (records) {
+          records.forEach(function (record) {
+            Array.prototype.forEach.call(record.addedNodes || [], function (node) {
+              if (node && node.nodeType === 1) {
+                if (initialApplicationFinished) {
+                  queueRoot(node);
+                } else {
+                  applyChanges(node);
+                }
+              }
+            });
+          });
+
+          if (initialApplicationFinished) {
+            scheduleHealthCheck(2000);
+          }
+        });
+
+        observer.observe(document.documentElement, {
+          childList: true,
+          subtree: true
+        });
+      }
+
+      window.addEventListener('pagehide', function () {
+        stopped = true;
+        queuedRoots = [];
+
+        if (observer) {
+          observer.disconnect();
+        }
+
+        if (healthTimer) {
+          window.clearTimeout(healthTimer);
+          healthTimer = null;
+        }
+      }, { once: true });
+    })();
+    </script>
+    <?php
+}, 2 );
 
 
 /**
@@ -14762,6 +17022,7 @@ add_filter( 'woocommerce_product_variation_get_sale_price', function( $price, $p
     }
 
     $scroll_depth = abtestkit_pt_scroll_depth_for_test( $test );
+    $engagement_sample_rate = abtestkit_engagement_sample_rate();
 
     ?>
 <script>
@@ -14774,10 +17035,95 @@ add_filter( 'woocommerce_product_variation_get_sale_price', function( $price, $p
     variant: "<?php echo ( $assigned === 'B' ? 'B' : 'A' ); ?>",
     goal: "<?php echo esc_js( $goal ); ?>",
     targets: <?php echo wp_json_encode( $targets ); ?>, // hrefs or CSS selectors
-    scrollDepth: <?php echo (int) $scroll_depth; ?>
+    scrollDepth: <?php echo (int) $scroll_depth; ?>,
+    engagementSampleRate: <?php echo wp_json_encode( $engagement_sample_rate ); ?>
   };
 
   if (!Array.isArray(cfg.targets)) cfg.targets = [];
+
+  // Sample engagement locally, then make at most one small request when the
+  // sampled pageview exits. There is no timer-based polling or repeated write.
+  (function trackSampledEngagement(){
+    var sampleRate = Number(cfg.engagementSampleRate);
+    if (
+      window.location.protocol !== "https:" ||
+      !isFinite(sampleRate) ||
+      sampleRate <= 0 ||
+      Math.random() >= Math.min(1, sampleRate)
+    ) {
+      return;
+    }
+
+    var sent = false;
+    var maxPageDepth = 0;
+    var activeMilliseconds = 0;
+    var visibleStartedAt = document.visibilityState === "visible" ? Date.now() : 0;
+    var depthFrame = 0;
+
+    function updateMaxPageDepth() {
+      maxPageDepth = Math.max(maxPageDepth, getScrollDepthPercent());
+    }
+
+    function queueDepthUpdate() {
+      if (depthFrame) return;
+      depthFrame = window.requestAnimationFrame(function(){
+        depthFrame = 0;
+        updateMaxPageDepth();
+      });
+    }
+
+    function pauseVisibleClock() {
+      if (!visibleStartedAt) return;
+      activeMilliseconds += Math.max(0, Date.now() - visibleStartedAt);
+      visibleStartedAt = 0;
+    }
+
+    function resumeVisibleClock() {
+      if (!visibleStartedAt) visibleStartedAt = Date.now();
+    }
+
+    function reportEngagement() {
+      if (sent) return;
+      sent = true;
+      pauseVisibleClock();
+      updateMaxPageDepth();
+
+      fetch(cfg.rest + "/track?t=" + Date.now(), {
+        method: "POST",
+        credentials: "same-origin",
+        keepalive: true,
+        cache: "no-store",
+        headers: {
+          "Content-Type": "application/json",
+          "X-WP-Nonce": cfg.nonce
+        },
+        body: JSON.stringify({
+          type: "engagement",
+          abTestId: cfg.abTestId,
+          postId: cfg.postId,
+          index: 0,
+          variant: cfg.variant,
+          scroll: Math.max(0, Math.min(100, Math.round(maxPageDepth))),
+          seconds: Math.max(0, Math.round(activeMilliseconds / 1000)),
+          protocol: "https"
+        })
+      }).catch(function(){});
+    }
+
+    document.addEventListener("visibilitychange", function(){
+      if (document.visibilityState === "visible") {
+        resumeVisibleClock();
+        queueDepthUpdate();
+      } else {
+        pauseVisibleClock();
+      }
+    }, { passive: true });
+    window.addEventListener("scroll", queueDepthUpdate, { passive: true });
+    window.addEventListener("resize", queueDepthUpdate, { passive: true });
+    window.addEventListener("pagehide", reportEngagement, { once: true });
+    window.addEventListener("load", queueDepthUpdate, { once: true, passive: true });
+    queueDepthUpdate();
+  })();
 
   // --- Helpers --------------------------------------------------------------
   function trackClickOnce() {
@@ -15138,11 +17484,13 @@ function abtestkit_create_event_table() {
         post_id BIGINT,
         ab_test_id VARCHAR(64),
         variant CHAR(1),
-        event_type ENUM('impression','click','purchase','decision','decision_applied','stale','protocol_warning'),
+        event_type ENUM('impression','click','purchase','engagement','decision','decision_applied','stale','protocol_warning'),
         order_id BIGINT NULL,
         amount DECIMAL(18,2) NULL,
         protocol VARCHAR(10) NULL,
         excluded_reason VARCHAR(50) NULL,
+        scroll_pct TINYINT UNSIGNED NULL,
+        time_sec INT UNSIGNED NULL,
         ip VARCHAR(45),
         user_agent TEXT,
         KEY idx_time (time),
@@ -15166,6 +17514,27 @@ function abtestkit_create_event_table() {
         $wpdb->prepare( 'SHOW COLUMNS FROM %i', $table ),
         0
     );
+
+    // dbDelta can leave an existing ENUM unchanged, so verify the new event
+    // type explicitly before engagement rows are accepted on upgraded sites.
+    // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+    $event_type_definition = $wpdb->get_row(
+        $wpdb->prepare( 'SHOW COLUMNS FROM %i LIKE %s', $table, 'event_type' ),
+        ARRAY_A
+    );
+    $event_type_sql = is_array( $event_type_definition )
+        ? (string) ( $event_type_definition['Type'] ?? $event_type_definition['type'] ?? '' )
+        : '';
+
+    if ( $event_type_sql !== '' && strpos( $event_type_sql, "'engagement'" ) === false ) {
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+        $wpdb->query(
+            $wpdb->prepare(
+                "ALTER TABLE %i MODIFY `event_type` ENUM('impression','click','purchase','engagement','decision','decision_applied','stale','protocol_warning')",
+                $table
+            )
+        );
+    }
 
     if ( is_array( $columns ) ) {
         if ( ! in_array( 'order_id', $columns, true ) ) {
@@ -15203,6 +17572,26 @@ function abtestkit_create_event_table() {
             $wpdb->query(
                 $wpdb->prepare(
                     'ALTER TABLE %i ADD COLUMN `excluded_reason` VARCHAR(50) NULL AFTER `protocol`',
+                    $table
+                )
+            );
+        }
+
+        if ( ! in_array( 'scroll_pct', $columns, true ) ) {
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+            $wpdb->query(
+                $wpdb->prepare(
+                    'ALTER TABLE %i ADD COLUMN `scroll_pct` TINYINT UNSIGNED NULL AFTER `excluded_reason`',
+                    $table
+                )
+            );
+        }
+
+        if ( ! in_array( 'time_sec', $columns, true ) ) {
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+            $wpdb->query(
+                $wpdb->prepare(
+                    'ALTER TABLE %i ADD COLUMN `time_sec` INT UNSIGNED NULL AFTER `scroll_pct`',
                     $table
                 )
             );
@@ -15306,7 +17695,7 @@ function abtestkit_create_event_table() {
     }
     // phpcs:enable WordPress.DB.DirectDatabaseQuery.SchemaChange
 
-    update_option( 'abtestkit_events_schema_version', 4, false );
+    update_option( 'abtestkit_events_schema_version', 5, false );
 }
 
 add_action( 'admin_init', function() {

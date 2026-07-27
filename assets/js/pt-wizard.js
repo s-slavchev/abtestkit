@@ -880,11 +880,13 @@ const ElementPicker = ({
   label = "Version A",
   previewMode = "mobile",
   allowAnyElement = false,
+  preferExactElement = false,
   actionLabel = "",
   interactiveWhenNotPicking = false,
   previewVariant = "",
   previewCss = "",
   previewMarkers = [],
+  previewHtmlChanges = [],
   showTargetRefreshButton = false,
   afterPreviewContent = null,
 }) => {
@@ -895,6 +897,7 @@ const ElementPicker = ({
   const [previewWrapWidth, setPreviewWrapWidth] = useState(0);
   const [refreshNonce, setRefreshNonce] = useState(0);
   const [previewLoadState, setPreviewLoadState] = useState("loading");
+  const [htmlMatchCounts, setHtmlMatchCounts] = useState({});
 
   const makePickerUrl = (baseUrl, nonce = 0) => {
     let next = String(baseUrl || "").trim();
@@ -945,10 +948,70 @@ const ElementPicker = ({
     return el.closest(".wp-block-buttons, .wp-block-group, main, article, section, .entry-content, body");
   };
 
-  const makeSelector = (rawEl) => {
+  const makeExactSelector = (el) => {
+    if (!el || !el.tagName) return "";
+    if (el.id) return "#" + cssEscape(el.id);
+
+    const doc = el.ownerDocument;
+    const parts = [];
+    let cur = el;
+
+    while (cur && cur.tagName && cur !== doc.documentElement) {
+      if (cur.id) {
+        parts.unshift("#" + cssEscape(cur.id));
+        break;
+      }
+
+      let seg = cur.tagName.toLowerCase();
+      const stableClasses = [...(cur.classList || [])]
+        .filter((className) => {
+          const name = String(className || "");
+          return (
+            name &&
+            name.indexOf("abtestkit-") !== 0 &&
+            !/^(active|current|selected|open|opened|hover|focus|is-active|is-open|is-selected)$/i.test(name)
+          );
+        })
+        .slice(0, 2);
+
+      if (stableClasses.length) {
+        seg += "." + stableClasses.map(cssEscape).join(".");
+      }
+
+      const parent = cur.parentElement;
+      if (parent) {
+        const sameTagSiblings = Array.from(parent.children).filter(
+          (sibling) => sibling.tagName === cur.tagName
+        );
+
+        if (sameTagSiblings.length > 1) {
+          seg += `:nth-of-type(${sameTagSiblings.indexOf(cur) + 1})`;
+        }
+      }
+
+      parts.unshift(seg);
+
+      const candidate = parts.join(" > ");
+      try {
+        if (doc.querySelectorAll(candidate).length === 1) {
+          return candidate;
+        }
+      } catch (_) {}
+
+      cur = parent;
+    }
+
+    return parts.join(" > ");
+  };
+
+  const makeSelector = (rawEl, exactElement = false) => {
     if (!rawEl || !rawEl.tagName) return "";
 
-    // Always build the selector for the *clickable* thing
+    if (exactElement) {
+      return makeExactSelector(rawEl);
+    }
+
+    // Existing click/CSS behaviour: build the selector for the clickable thing.
     const el =
       rawEl.closest("a[href],button,[role='button'],[onclick],input[type='submit'],.wp-block-button__link") ||
       rawEl;
@@ -1082,7 +1145,7 @@ const ElementPicker = ({
         }
 
         const anchor = t.closest("a[href]");
-        const selector = makeSelector(t);
+        const selector = makeSelector(t, preferExactElement);
 
         // Build a small display payload (for the UI list)
         let href = "";
@@ -1133,7 +1196,13 @@ const ElementPicker = ({
           label = t.textContent.trim().replace(/\s+/g, " ").slice(0, 80);
         }
 
-        onPick({ selector, href, label });
+        onPick({
+          selector,
+          href,
+          label,
+          inner_html: t && typeof t.innerHTML === "string" ? t.innerHTML : "",
+          tag_name: t && t.tagName ? String(t.tagName).toLowerCase() : "",
+        });
 
         cleanup();
       };
@@ -1234,6 +1303,7 @@ const ElementPicker = ({
 
     setPicking(false);
     setPreviewLoadState(url ? "loading" : "idle");
+    setHtmlMatchCounts({});
 
     if (!frame || !url) {
       return;
@@ -1269,7 +1339,11 @@ const ElementPicker = ({
         postId: pageId,
         url,
         label,
-        context: allowAnyElement ? "css_marker_picker" : "click_picker",
+        context: preferExactElement
+          ? "html_selector_picker"
+          : allowAnyElement
+          ? "css_marker_picker"
+          : "click_picker",
       });
     }, ABTK_PREVIEW_LOAD_TIMEOUT_MS);
 
@@ -1292,7 +1366,7 @@ const ElementPicker = ({
       window.clearTimeout(timer);
       frame.removeEventListener("load", onLoad);
     };
-  }, [url, pageId, label, allowAnyElement]);
+  }, [url, pageId, label, allowAnyElement, preferExactElement]);
 
   useEffect(() => {
     const frame = frameRef.current;
@@ -1300,14 +1374,58 @@ const ElementPicker = ({
       return;
     }
 
+    const htmlChanges = Array.isArray(previewHtmlChanges)
+      ? previewHtmlChanges
+      : [];
+
     const shouldApplyCustomPreview =
       String(previewVariant || "").toUpperCase() === "B" ||
       String(previewCss || "").trim() !== "" ||
-      (Array.isArray(previewMarkers) && previewMarkers.length > 0);
+      (Array.isArray(previewMarkers) && previewMarkers.length > 0) ||
+      htmlChanges.length > 0;
 
     if (!shouldApplyCustomPreview) {
       return;
     }
+
+    let restored = false;
+    const appliedHtml = [];
+
+    const undoAppliedHtml = () => {
+      appliedHtml.reverse().forEach((item) => {
+        if (!item) {
+          return;
+        }
+
+        if (item.type === "replace" && item.el && typeof item.original === "string") {
+          try {
+            item.el.innerHTML = item.original;
+          } catch (_) {}
+          return;
+        }
+
+        if (item.type === "insert" && Array.isArray(item.nodes)) {
+          item.nodes.forEach((node) => {
+            try {
+              if (node && node.parentNode) {
+                node.parentNode.removeChild(node);
+              }
+            } catch (_) {}
+          });
+        }
+      });
+
+      appliedHtml.length = 0;
+    };
+
+    const restoreHtmlPreview = () => {
+      if (restored) {
+        return;
+      }
+
+      restored = true;
+      undoAppliedHtml();
+    };
 
     const applyCustomPreview = () => {
       let doc;
@@ -1322,8 +1440,20 @@ const ElementPicker = ({
         return;
       }
 
+      if (appliedHtml.length) {
+        undoAppliedHtml();
+      }
+
+      const nextMatchCounts = {};
+
       if (doc.body && doc.body.classList) {
-        doc.body.classList.add("abtestkit-custom-css-b");
+        doc.body.classList.remove("abtestkit-custom-css-b", "abtestkit-custom-html-b");
+
+        if (htmlChanges.length > 0) {
+          doc.body.classList.add("abtestkit-custom-html-b");
+        } else {
+          doc.body.classList.add("abtestkit-custom-css-b");
+        }
       }
 
       try {
@@ -1366,13 +1496,92 @@ const ElementPicker = ({
         style.appendChild(doc.createTextNode(css));
         (doc.head || doc.documentElement).appendChild(style);
       }
+
+      htmlChanges.forEach((change, changeIndex) => {
+        const selector = String((change && change.selector) || "").trim();
+        const html = String((change && change.html) || "");
+        const operation = [
+          "replace_contents",
+          "insert_before",
+          "insert_after",
+          "prepend_inside",
+          "append_inside",
+        ].includes(String((change && change.operation) || "replace_contents"))
+          ? String((change && change.operation) || "replace_contents")
+          : "replace_contents";
+        const matchMode = String((change && change.match_mode) || "all") === "first"
+          ? "first"
+          : "all";
+
+        if (!selector) {
+          nextMatchCounts[changeIndex] = -1;
+          return;
+        }
+
+        try {
+          const matched = Array.from(doc.querySelectorAll(selector));
+          const targets = matchMode === "first" ? matched.slice(0, 1) : matched;
+          nextMatchCounts[changeIndex] = matched.length;
+
+          targets.forEach((el) => {
+            if (!el) {
+              return;
+            }
+
+            if (operation === "replace_contents") {
+              if (typeof el.innerHTML !== "string") {
+                return;
+              }
+
+              appliedHtml.push({ type: "replace", el, original: el.innerHTML });
+              el.innerHTML = html;
+              return;
+            }
+
+            const template = doc.createElement("template");
+            template.innerHTML = html;
+            const fragment = template.content
+              ? template.content.cloneNode(true)
+              : doc.createRange().createContextualFragment(html);
+            const insertedNodes = Array.from(fragment.childNodes || []);
+
+            if (operation === "insert_before") {
+              if (!el.parentNode) return;
+              el.parentNode.insertBefore(fragment, el);
+            } else if (operation === "insert_after") {
+              if (!el.parentNode) return;
+              el.parentNode.insertBefore(fragment, el.nextSibling);
+            } else if (operation === "prepend_inside") {
+              el.insertBefore(fragment, el.firstChild);
+            } else {
+              el.appendChild(fragment);
+            }
+
+            appliedHtml.push({ type: "insert", nodes: insertedNodes });
+          });
+        } catch (_) {
+          nextMatchCounts[changeIndex] = -1;
+        }
+      });
+
+      setHtmlMatchCounts(nextMatchCounts);
     };
 
     frame.addEventListener("load", applyCustomPreview);
     applyCustomPreview();
 
-    return () => frame.removeEventListener("load", applyCustomPreview);
-  }, [url, previewLoadState, previewVariant, previewCss, JSON.stringify(previewMarkers || [])]);
+    return () => {
+      frame.removeEventListener("load", applyCustomPreview);
+      restoreHtmlPreview();
+    };
+  }, [
+    url,
+    previewLoadState,
+    previewVariant,
+    previewCss,
+    JSON.stringify(previewMarkers || []),
+    JSON.stringify(previewHtmlChanges || []),
+  ]);
 
   const hasPicks = Array.isArray(selected) && selected.length > 0;
   const buttonLabel =
@@ -1471,6 +1680,48 @@ const ElementPicker = ({
           : null,
       ]
     ),
+
+    Array.isArray(previewHtmlChanges) && previewHtmlChanges.length
+      ? h(
+          "div",
+          {
+            style: {
+              marginTop: 10,
+              padding: "10px 12px",
+              background: "#f6f7f7",
+              border: "1px solid #dcdcde",
+              borderRadius: 6,
+              fontSize: 12,
+              color: "#50575e",
+            },
+          },
+          previewHtmlChanges.map((change, index) => {
+            const count = Object.prototype.hasOwnProperty.call(htmlMatchCounts, index)
+              ? htmlMatchCounts[index]
+              : null;
+            const matchText = count === -1
+              ? "Invalid selector"
+              : count === null
+              ? "Checking selector…"
+              : `${count} ${count === 1 ? "match" : "matches"}`;
+            const applyText = String((change && change.match_mode) || "all") === "first"
+              ? "first match"
+              : "all matches";
+
+            return h(
+              "div",
+              {
+                key: `${String((change && change.selector) || "selector")}-${index}`,
+                style: { marginTop: index ? 4 : 0 },
+              },
+              [
+                h("code", null, String((change && change.selector) || "—")),
+                ` — ${matchText}; applying to ${applyText}`,
+              ]
+            );
+          })
+        )
+      : null,
 
     afterPreviewContent
       ? h(
@@ -2484,11 +2735,15 @@ function fetchPages(postType, q) {
       setGoalPage(null);
       setDestinationPostType("page");
 
-      // Custom CSS
+      // Custom Code
+      setCustomCodeType("");
       setCssScope("page");
       setCustomCss("");
       setCssMarkers([]);
       setCssPreviewMode("desktop");
+      setCustomHtmlChanges([]);
+      setManualHtmlSelector("");
+      setHtmlPreviewMode("desktop");
 
       // Product overrides
       setProductPreviewToken("");
@@ -2539,7 +2794,8 @@ function fetchPages(postType, q) {
           String(productBImageUrl || "").trim() !== "" ||
           String(productBGalleryUrls || "").trim() !== "" ||
           String(customCss || "").trim() !== "" ||
-          (Array.isArray(cssMarkers) && cssMarkers.length > 0)
+          (Array.isArray(cssMarkers) && cssMarkers.length > 0) ||
+          (Array.isArray(customHtmlChanges) && customHtmlChanges.length > 0)
         );
 
       if (!hasProgressToLose) {
@@ -2600,9 +2856,12 @@ function fetchPages(postType, q) {
     const [goal, setGoal] = useState("");
     const [scrollDepth, setScrollDepth] = useState("50");
 
+    const [customCodeType, setCustomCodeType] = useState("");
     const [cssScope, setCssScope] = useState("page");
     const [customCss, setCustomCss] = useState("");
     const [cssMarkers, setCssMarkers] = useState([]);
+    const [customHtmlChanges, setCustomHtmlChanges] = useState([]);
+    const [manualHtmlSelector, setManualHtmlSelector] = useState("");
 
     // Decision rule (min impressions + min conversions, or manual)
     // fast     = 25 impressions + 3 conversions
@@ -2623,6 +2882,16 @@ function fetchPages(postType, q) {
     const [clickScope, setClickScope] = useState("on_test_pages");
     const [clickPreviewMode, setClickPreviewMode] = useState("mobile");
     const [cssPreviewMode, setCssPreviewMode] = useState("desktop");
+    const [htmlPreviewMode, setHtmlPreviewMode] = useState("desktop");
+
+    const isCustomCode = postType === "custom_code";
+    const isCustomCss = isCustomCode && customCodeType === "custom_css";
+    const isCustomHtml = isCustomCode && customCodeType === "custom_html";
+    const customCodeTestType = isCustomCss
+      ? "custom_css"
+      : isCustomHtml
+      ? "custom_html"
+      : "";
 
     const [showWizardCompatibilityHelp, setShowWizardCompatibilityHelp] = useState(false);
     const [wizardCompatibilityMessage, setWizardCompatibilityMessage] = useState("");
@@ -2669,10 +2938,13 @@ function fetchPages(postType, q) {
       setClickPreviewMode("mobile");
     };
 
-    const clearCustomCssState = () => {
+    const clearCustomCodeState = () => {
       setCustomCss("");
       setCssMarkers([]);
       setCssPreviewMode("desktop");
+      setCustomHtmlChanges([]);
+      setManualHtmlSelector("");
+      setHtmlPreviewMode("desktop");
     };
 
     const clearProductBState = () => {
@@ -2709,7 +2981,7 @@ function fetchPages(postType, q) {
       setClickScope("on_test_pages");
       setScrollDepth("50");
       clearClickTargetState();
-      clearCustomCssState();
+      clearCustomCodeState();
       clearProductBState();
     };
 
@@ -2826,6 +3098,7 @@ function fetchPages(postType, q) {
     const tlmSessionIdRef = useRef("");
     const tlmStartedAtRef = useRef(0);
     const tlmNavDirRef = useRef("start"); // start|next|back|jump
+    const tlmProgressRef = useRef({});
 
     const tlmMs = () => abtkSafeInt(Date.now() - (tlmStartedAtRef.current || Date.now()), 0, 86400000);
 
@@ -2840,6 +3113,20 @@ function fetchPages(postType, q) {
     const tlmStepKey = () => {
       // Stable step keys (do NOT depend on step titles)
       if (step === 0) return "select_type";
+
+      if (isCustomCode) {
+        if (step === 1) return "select_custom_code_type";
+        if (step === 2) return "select_control";
+        if (step === 3) return "review_versions";
+        if (step === 4) return "choose_conversion_type";
+        if ((goal === "clicks" || goal === "destination_url" || goal === "scroll_depth") && step === 5) {
+          if (goal === "destination_url") return "set_destination_url";
+          if (goal === "scroll_depth") return "set_scroll_depth";
+          return "select_click_targets";
+        }
+        return "summary";
+      }
+
       if (step === 1) return "select_control";
 
       if (postType === "product") {
@@ -2863,6 +3150,49 @@ function fetchPages(postType, q) {
         return "select_click_targets";
       }
       return "summary";
+    };
+
+    /*
+     * Local, privacy-safe progress used only if this administrator later
+     * explicitly submits deactivation feedback. Keep content, titles, post
+     * IDs, URLs, selectors and custom code out of this object.
+     */
+    tlmProgressRef.current = {
+      ui: ABTK_WIZ_UI,
+      step: tlmStepKey(),
+      step_index: abtkSafeInt(step, 0, 50),
+      kind: String(postType || ""),
+      custom_code_type: String(customCodeType || ""),
+      scope: String(isCustomCode ? cssScope : postType || ""),
+      b_mode: String(isCustomCode ? customCodeTestType : bMode || ""),
+      has_control: pageA && pageA.id ? 1 : 0,
+      has_variant:
+        (pageB && pageB.id) ||
+        (isCustomCss && String(customCss || "").trim()) ||
+        (isCustomHtml && customHtmlChanges.length)
+          ? 1
+          : 0,
+      has_temp_variant: tempBDraftId ? 1 : 0,
+      edited_variant: hasEditedB ? 1 : 0,
+      seo_safe_existing_b: bMode === "existing" ? (seoSafeExistingB ? 1 : 0) : 1,
+      goal: String(goal || ""),
+      conversion_chosen: conversionChosen ? 1 : 0,
+      click_scope: String(clickScope || ""),
+      links_count: tlmLinksCount(),
+      scroll_depth: abtkSafeInt(scrollDepth, 0, 100),
+      decision_mode: tlmDecisionMode(),
+      decision_rule: String(decisionRule || ""),
+      custom_css_length: String(customCss || "").length,
+      css_marker_count: Array.isArray(cssMarkers) ? cssMarkers.length : 0,
+      html_change_count: Array.isArray(customHtmlChanges) ? customHtmlChanges.length : 0,
+      has_error: error ? 1 : 0,
+      product_title_changed: showProductBTitle ? 1 : 0,
+      product_price_changed: showProductBPrice ? 1 : 0,
+      product_sale_price_changed: showProductBSalePrice ? 1 : 0,
+      product_short_description_changed: showProductBShortDesc ? 1 : 0,
+      product_long_description_changed: showProductBLongDesc ? 1 : 0,
+      product_image_changed: showProductBImage ? 1 : 0,
+      product_gallery_changed: showProductBGallery ? 1 : 0,
     };
 
     const tlmBase = () => ({
@@ -2959,15 +3289,32 @@ function fetchPages(postType, q) {
       try {
         const curRaw = window.localStorage.getItem(ABTK_WIZ_LS_KEY);
         const cur = curRaw ? JSON.parse(curRaw) : {};
+        const progress = tlmProgressRef.current || {};
+        const currentStepIndex = abtkSafeInt(progress.step_index, 0, 50);
+        const sameSession =
+          cur.session_id &&
+          String(cur.session_id) === String(tlmSessionIdRef.current || "");
+        const priorFurthestIndex = sameSession
+          ? abtkSafeInt(cur.furthest_step_index, 0, 50)
+          : 0;
+        const reachedNewFurthest =
+          !sameSession || !cur.furthest_step || currentStepIndex > priorFurthestIndex;
 
         // IMPORTANT: spread `cur` first so it can’t overwrite the current session_id
         const next = {
           ...cur,
+          ...progress,
 
           session_id: tlmSessionIdRef.current,
           ui: ABTK_WIZ_UI,
           last_seen: Date.now(),
           step: tlmStepKey(),
+          furthest_step: reachedNewFurthest
+            ? String(progress.step || tlmStepKey())
+            : String(cur.furthest_step || ""),
+          furthest_step_index: reachedNewFurthest
+            ? currentStepIndex
+            : priorFurthestIndex,
           ms: tlmMs(),
           completed: false,
           kind: String(postType || ""),
@@ -3121,6 +3468,41 @@ function fetchPages(postType, q) {
       decisionRule,
     ]);
 
+    // Persist meaningful progress changes immediately; the existing interval
+    // only refreshes last_seen while the wizard remains open.
+    useEffect(() => {
+      if (!tlmSessionIdRef.current) return;
+      tlmPersist({});
+    }, [
+      step,
+      postType,
+      customCodeType,
+      cssScope,
+      pageA && pageA.id,
+      bMode,
+      pageB && pageB.id,
+      tempBDraftId,
+      hasEditedB,
+      seoSafeExistingB,
+      goal,
+      conversionChosen,
+      clickScope,
+      links,
+      scrollDepth,
+      decisionRule,
+      customCss,
+      cssMarkers,
+      customHtmlChanges,
+      error,
+      showProductBTitle,
+      showProductBPrice,
+      showProductBSalePrice,
+      showProductBShortDesc,
+      showProductBLongDesc,
+      showProductBImage,
+      showProductBGallery,
+    ]);
+
     // Fetch lists
     useEffect(() => {
       if (!postType) {
@@ -3128,14 +3510,14 @@ function fetchPages(postType, q) {
         return;
       }
       setLoading(true);
-      fetchPages(postType === "custom_css" ? cssScope : postType, pageSearch)
+      fetchPages(isCustomCode ? cssScope : postType, pageSearch)
         .then(setPages)
         .catch((err) => {
           console.error("abtestkit wizard fetch failed:", err);
           setError("Could not load items. Please try a narrower search.");
         })
         .finally(() => setLoading(false));
-    }, [pageSearch, postType, cssScope]);
+    }, [pageSearch, postType, cssScope, customCodeType]);
 
     useEffect(() => {
       if (bMode !== "existing" || !postType) {
@@ -3238,16 +3620,19 @@ function fetchPages(postType, q) {
       };
     }, [bMode, pageA && pageA.id, pageB && pageB.id, tempBDraftId, postType]);
 
-    // Step 0: must choose test type (page, post or product)
+    // Step 0: must choose a top-level test type.
     const canNext0 =
       postType === "page" ||
       postType === "post" ||
       postType === "product" ||
       postType === "reusable_section" ||
-      postType === "custom_css";
+      postType === "custom_code";
 
+    // Custom Code adds one extra choice before the normal control selection.
+    const canNextCustomCodeType =
+      customCodeType === "custom_css" || customCodeType === "custom_html";
 
-    // Step 1: must pick Version A
+    // Control selection must have a real page/post/product.
     const canNext1 = !!pageA;
 
     // Keep the auto-generated title synced to the current Version A source,
@@ -3268,20 +3653,18 @@ function fetchPages(postType, q) {
     }, [pageA && pageA.id]);
 
     useEffect(() => {
-      if (postType !== "custom_css") {
+      if (!isCustomCode) {
         return;
       }
 
       setPageA(null);
-      setPageSearch("");
-      setPages([]);
       setTestTitle("");
       testTitleManuallyEditedRef.current = false;
       setGoal("");
       setConversionChosen(false);
       clearClickTargetState();
-      setCssPreviewMode("desktop");
-    }, [cssScope]);
+      clearCustomCodeState();
+    }, [cssScope, customCodeType]);
 
     // If Version A changes, Version B must be reset (prevents mismatched A/B pairs)
     useEffect(() => {
@@ -3470,8 +3853,16 @@ function fetchPages(postType, q) {
     //     • existing: just need a valid B selected.
     // - Products:
     //     • must have at least one Version B override filled in.
+    const hasCompleteCustomHtmlChange =
+      Array.isArray(customHtmlChanges) &&
+      customHtmlChanges.some(
+        (change) => String((change && change.selector) || "").trim() !== ""
+      );
+
     const canNext3 =
-      postType === "custom_css"
+      isCustomHtml
+        ? hasCompleteCustomHtmlChange
+        : isCustomCss
         ? String(customCss || "").trim().length > 0
         : postType === "product"
         ? !!pageB && hasEditedB
@@ -3517,12 +3908,14 @@ function fetchPages(postType, q) {
       const payload = {
         control_id: pageA.id,
         test_title: String(testTitle || "").trim(),
-        test_type: postType,
-        b_mode: postType === "custom_css" ? "custom_css" : bMode,
-        b_page_id: postType === "custom_css" ? 0 : (bMode === "existing" ? (pageB && pageB.id) : 0),
-        css_scope: postType === "custom_css" ? cssScope : "",
-        custom_css: postType === "custom_css" ? customCss : "",
-        css_markers: postType === "custom_css" ? cssMarkers : [],
+        test_type: isCustomCode ? customCodeTestType : postType,
+        b_mode: isCustomCode ? customCodeTestType : bMode,
+        b_page_id: isCustomCode ? 0 : (bMode === "existing" ? (pageB && pageB.id) : 0),
+        css_scope: isCustomCss ? cssScope : "",
+        custom_css: isCustomCss ? customCss : "",
+        css_markers: isCustomCss ? cssMarkers : [],
+        html_scope: isCustomHtml ? cssScope : "",
+        html_changes: isCustomHtml ? customHtmlChanges : [],
 
         // Existing page as B: optional SEO protection toggle
         seo_safe_existing_b: bMode === "existing" ? !!seoSafeExistingB : true,
@@ -3583,6 +3976,9 @@ function fetchPages(postType, q) {
                 break;
               case "missing_custom_css":
                 msg = "Add Version B CSS before creating this Custom CSS test.";
+                break;
+              case "missing_custom_html":
+                msg = "Select at least one element and add Version B HTML before creating this Custom HTML test.";
                 break;
               case "create_failed":
                 msg = "Couldn’t create the test. Please try again.";
@@ -3658,6 +4054,15 @@ function fetchPages(postType, q) {
         .finally(() => setLoading(false));
     };
 
+    const selectableCardStyle = (isSelected) => ({
+      cursor: "pointer",
+      boxSizing: "border-box",
+      border: `1px solid ${isSelected ? "#2271b1" : "#dcdcde"}`,
+      boxShadow: isSelected
+        ? "0 0 0 1px #2271b1, 0 1px 2px rgba(0,0,0,0.04)"
+        : "0 1px 2px rgba(0,0,0,0.04)",
+    });
+
     /* Step 0 – Select test type (Page, Post or WooCommerce product) */
     const stepType = h(Fragment, null, [
       h("p", null, "What would you like to test?"),
@@ -3678,17 +4083,7 @@ function fetchPages(postType, q) {
             Card,
             {
               onClick: () => selectTestType("page"),
-              style: {
-                cursor: "pointer",
-                border:
-                  postType === "page"
-                    ? "2px solid #2271b1"
-                    : "1px solid #dcdcde",
-                boxShadow:
-                  postType === "page"
-                    ? "0 0 0 1px #2271b133"
-                    : "0 1px 2px rgba(0,0,0,0.04)",
-              },
+              style: selectableCardStyle(postType === "page"),
             },
             h(CardBody, null, [
               h("h3", { style: { margin: 0 } }, "Page"),
@@ -3710,17 +4105,7 @@ function fetchPages(postType, q) {
             Card,
             {
               onClick: () => selectTestType("post"),
-              style: {
-                cursor: "pointer",
-                border:
-                  postType === "post"
-                    ? "2px solid #2271b1"
-                    : "1px solid #dcdcde",
-                boxShadow:
-                  postType === "post"
-                    ? "0 0 0 1px #2271b133"
-                    : "0 1px 2px rgba(0,0,0,0.04)",
-              },
+              style: selectableCardStyle(postType === "post"),
             },
             h(CardBody, null, [
               h("h3", { style: { margin: 0 } }, "Post"),
@@ -3742,17 +4127,7 @@ function fetchPages(postType, q) {
             Card,
             {
               onClick: () => selectTestType("product"),
-              style: {
-                cursor: "pointer",
-                border:
-                  postType === "product"
-                    ? "2px solid #2271b1"
-                    : "1px solid #dcdcde",
-                boxShadow:
-                  postType === "product"
-                    ? "0 0 0 1px #2271b133"
-                    : "0 1px 2px rgba(0,0,0,0.04)",
-              },
+              style: selectableCardStyle(postType === "product"),
             },
             h(CardBody, null, [
               h("h3", { style: { margin: 0 } }, "WooCommerce product"),
@@ -3769,34 +4144,24 @@ function fetchPages(postType, q) {
             ])
           ),
 
-          // CUSTOM CSS CARD
+          // CUSTOM CODE CARD
           h(
             Card,
             {
-              onClick: () => selectTestType("custom_css"),
-              style: {
-                cursor: "pointer",
-                border:
-                  postType === "custom_css"
-                    ? "2px solid #2271b1"
-                    : "1px solid #dcdcde",
-                boxShadow:
-                  postType === "custom_css"
-                    ? "0 0 0 1px #2271b133"
-                    : "0 1px 2px rgba(0,0,0,0.04)",
-              },
+              onClick: () => selectTestType("custom_code"),
+              style: selectableCardStyle(postType === "custom_code"),
             },
             h(CardBody, null, [
-              h("h3", { style: { margin: 0 } }, "Custom CSS"),
+              h("h3", { style: { margin: 0 } }, "Custom Code"),
               h(
                 "p",
                 { style: { marginTop: 4, color: "#50575e" } },
-                "Test a CSS-only visual change on a real page, post, or product."
+                "Test a CSS or HTML change on a real page, post, or product."
               ),
               h(
                 "p",
                 { style: { marginTop: 4, color: "#6c7781", fontSize: 12 } },
-                "No shadow version is created. Version B loads your CSS as an override layer."
+                "No shadow page is created. Version B applies only the custom code you configure."
               ),
             ])
           ),
@@ -3806,17 +4171,7 @@ function fetchPages(postType, q) {
             Card,
             {
               onClick: () => selectTestType("reusable_section"),
-              style: {
-                cursor: "pointer",
-                border:
-                  postType === "reusable_section"
-                    ? "2px solid #2271b1"
-                    : "1px solid #dcdcde",
-                boxShadow:
-                  postType === "reusable_section"
-                    ? "0 0 0 1px #2271b133"
-                    : "0 1px 2px rgba(0,0,0,0.04)",
-              },
+              style: selectableCardStyle(postType === "reusable_section"),
             },
             h(CardBody, null, [
               h("h3", { style: { margin: 0 } }, "Reusable Section"),
@@ -3836,13 +4191,71 @@ function fetchPages(postType, q) {
       ),
     ]);
 
+    /* Custom Code – choose the code layer before selecting a page */
+    const stepCustomCodeType = h(Fragment, null, [
+      h("p", null, "What kind of custom code would you like to test?"),
+      h(
+        "div",
+        {
+          style: {
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
+            gap: 16,
+            marginTop: 12,
+          },
+        },
+        [
+          h(
+            Card,
+            {
+              onClick: () => setCustomCodeType("custom_css"),
+              style: selectableCardStyle(customCodeType === "custom_css"),
+            },
+            h(CardBody, null, [
+              h("h3", { style: { margin: 0 } }, "CSS"),
+              h(
+                "p",
+                { style: { marginTop: 4, color: "#50575e" } },
+                "Change styling while keeping the original page content and URL."
+              ),
+              h(
+                "p",
+                { style: { marginTop: 4, color: "#6c7781", fontSize: 12 } },
+                "Use existing selectors directly or add B-only marker classes with the visual picker."
+              ),
+            ])
+          ),
+          h(
+            Card,
+            {
+              onClick: () => setCustomCodeType("custom_html"),
+              style: selectableCardStyle(customCodeType === "custom_html"),
+            },
+            h(CardBody, null, [
+              h("h3", { style: { margin: 0 } }, "HTML"),
+              h(
+                "p",
+                { style: { marginTop: 4, color: "#50575e" } },
+                "Replace or insert HTML around selected elements for Version B visitors."
+              ),
+              h(
+                "p",
+                { style: { marginTop: 4, color: "#6c7781", fontSize: 12 } },
+                "Choose a visual or manual selector, a safe operation, and whether to change the first or every match."
+              ),
+            ])
+          ),
+        ]
+      ),
+    ]);
+
     /* Step 1 – Select page/post/product (Version A / control) */
     const step0 = h(Fragment, null, [
       h(
         "p",
         null,
-        postType === "custom_css"
-          ? "Choose where this CSS should run, then select the page, post, or product."
+        isCustomCode
+          ? `Choose where this ${isCustomHtml ? "HTML" : "CSS"} should run, then select the page, post, or product.`
           : postType === "product"
           ? "Select a WooCommerce product to test."
           : postType === "post"
@@ -3851,7 +4264,7 @@ function fetchPages(postType, q) {
           ? "Select the source page ID used by your shortcode, for example the page inside [embed_page id=\"123\"]."
           : "Select a page to test."
       ),
-      postType === "custom_css" &&
+      isCustomCode &&
         h(
           "div",
           {
@@ -3864,7 +4277,7 @@ function fetchPages(postType, q) {
             },
           },
           h(SelectControl, {
-            label: "Where should this CSS run?",
+            label: `Where should this ${isCustomHtml ? "HTML" : "CSS"} run?`,
             value: cssScope,
             options: [
               { label: "Page", value: "page" },
@@ -3872,12 +4285,12 @@ function fetchPages(postType, q) {
               { label: "WooCommerce product", value: "product" },
             ],
             onChange: setCssScope,
-            help: "Version A is the original content. Version B is the same URL with your CSS applied.",
+            help: `Version A is the original content. Version B is the same URL with your ${isCustomHtml ? "HTML changes" : "CSS"} applied.`,
           })
         ),
       h(SearchControl, {
         label:
-          postType === "custom_css"
+          isCustomCode
             ? cssScope === "product"
               ? "Search products"
               : cssScope === "post"
@@ -4054,14 +4467,17 @@ function fetchPages(postType, q) {
                 }
               }, [postType, productALong, productBLongDesc]);
                   
-const customCssPreviewUrl =
+const customCodePreviewUrl =
   pageA
     ? (
         cssScope === "product"
-          ? getProductPreviewUrl(pageA, "A")
+          ? getProductPreviewUrl(pageA)
           : getEntityPreviewUrl(pageA, cssScope)
       )
     : "";
+
+const customCssPreviewUrl = isCustomCss ? customCodePreviewUrl : "";
+const customHtmlPreviewUrl = isCustomHtml ? customCodePreviewUrl : "";
 
 const addCustomCssMarker = (picked) => {
   const selector = String((picked && picked.selector) || "").trim();
@@ -4262,8 +4678,309 @@ const customCssPickerAfterPreviewContent = h(
   ]
 );
 
+const addCustomHtmlChange = (picked) => {
+  const selector = String((picked && picked.selector) || "").trim();
+  const tagName = String((picked && picked.tag_name) || "").toLowerCase();
+  const unsupportedTags = [
+    "html", "head", "body", "script", "style", "link", "meta"
+  ];
+  const voidTags = [
+    "img", "input", "br", "hr", "source", "area", "base", "col",
+    "embed", "param", "track", "wbr"
+  ];
+
+  if (!selector) {
+    return;
+  }
+
+  if (unsupportedTags.includes(tagName)) {
+    setError("Choose an element inside the page content rather than the document, head, body, script, style, link or meta element.");
+    return;
+  }
+
+  setError("");
+
+  setCustomHtmlChanges((current) => {
+    const list = Array.isArray(current) ? current : [];
+
+    if (list.some((change) => String(change.selector || "") === selector)) {
+      return list;
+    }
+
+    const label =
+      String((picked && picked.label) || "").trim() ||
+      selector.replace(/^[.#]/, "").split(/[ >.:[]/)[0] ||
+      "Selected element";
+
+    return [
+      ...list,
+      {
+        label,
+        selector,
+        operation: voidTags.includes(tagName) ? "insert_after" : "replace_contents",
+        match_mode: "all",
+        html: String((picked && picked.inner_html) || ""),
+        tag_name: tagName,
+      },
+    ];
+  });
+};
+
+const addManualCustomHtmlChange = () => {
+  const selector = String(manualHtmlSelector || "").trim();
+
+  if (!selector) {
+    setError("Enter an element selector before adding a manual HTML target.");
+    return;
+  }
+
+  try {
+    document.querySelector(selector);
+  } catch (_) {
+    setError("That element selector is not valid CSS selector syntax. Check its brackets, quotes and combinators, then try again.");
+    return;
+  }
+
+  addCustomHtmlChange({
+    selector,
+    label: selector.replace(/^[.#]/, "").split(/[ >.:[]/)[0] || "Manual selector",
+    inner_html: "",
+    tag_name: "",
+  });
+  setManualHtmlSelector("");
+};
+
+const updateCustomHtmlChange = (index, patch) => {
+  setCustomHtmlChanges((current) =>
+    (Array.isArray(current) ? current : []).map((change, changeIndex) =>
+      changeIndex === index ? { ...change, ...(patch || {}) } : change
+    )
+  );
+};
+
+const customHtmlOperationOptions = [
+  { label: "Replace selected element contents", value: "replace_contents" },
+  { label: "Insert before selected element", value: "insert_before" },
+  { label: "Insert after selected element", value: "insert_after" },
+  { label: "Prepend inside selected element", value: "prepend_inside" },
+  { label: "Append inside selected element", value: "append_inside" },
+];
+
+const customHtmlOperationHelp = (operation) => {
+  switch (String(operation || "replace_contents")) {
+    case "insert_before":
+      return "Adds the HTML immediately before the selected element without changing that element.";
+    case "insert_after":
+      return "Adds the HTML immediately after the selected element without changing that element.";
+    case "prepend_inside":
+      return "Adds the HTML as the first content inside the selected element.";
+    case "append_inside":
+      return "Adds the HTML as the last content inside the selected element.";
+    case "replace_contents":
+    default:
+      return "Replaces the contents inside the selected element while keeping its outer tag, classes and ID.";
+  }
+};
+
+const customHtmlOperationLabel = (operation) => {
+  const selected = customHtmlOperationOptions.find(
+    (option) => option.value === String(operation || "replace_contents")
+  );
+  return selected ? selected.label : "Replace selected element contents";
+};
+
+const customHtmlEditorCards = h(
+  "div",
+  { style: { marginTop: 16 } },
+  customHtmlChanges.length
+    ? customHtmlChanges.map((change, index) =>
+        h(
+          Card,
+          {
+            key: `${change.selector}-${index}`,
+            style: { marginBottom: 12 },
+          },
+          h(CardBody, null, [
+            h(
+              "div",
+              {
+                style: {
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: 12,
+                  alignItems: "flex-start",
+                  marginBottom: 10,
+                },
+              },
+              [
+                h("div", { style: { minWidth: 0 } }, [
+                  h("strong", null, change.label || `HTML change ${index + 1}`),
+                ]),
+                h(
+                  Button,
+                  {
+                    isSmall: true,
+                    isSecondary: true,
+                    onClick: () =>
+                      setCustomHtmlChanges((current) =>
+                        (Array.isArray(current) ? current : []).filter(
+                          (_, changeIndex) => changeIndex !== index
+                        )
+                      ),
+                  },
+                  "Remove"
+                ),
+              ]
+            ),
+            h(TextControl, {
+              label: "Element selector",
+              value: String(change.selector || ""),
+              onChange: (value) =>
+                updateCustomHtmlChange(index, { selector: String(value || "") }),
+              help: "Uses CSS selector syntax. Prefer a stable ID or attribute; the preview below reports how many elements currently match.",
+            }),
+            h(SelectControl, {
+              label: "HTML operation",
+              value: String(change.operation || "replace_contents"),
+              options:
+                ["img", "input", "br", "hr", "source", "area", "base", "col", "embed", "param", "track", "wbr"].includes(
+                  String(change.tag_name || "").toLowerCase()
+                )
+                  ? customHtmlOperationOptions.filter((option) =>
+                      option.value === "insert_before" || option.value === "insert_after"
+                    )
+                  : customHtmlOperationOptions,
+              onChange: (value) =>
+                updateCustomHtmlChange(index, { operation: String(value || "replace_contents") }),
+              help: customHtmlOperationHelp(change.operation),
+            }),
+            h(SelectControl, {
+              label: "Apply this change to",
+              value: String(change.match_mode || "all"),
+              options: [
+                { label: "All matching elements", value: "all" },
+                { label: "First matching element only", value: "first" },
+              ],
+              onChange: (value) =>
+                updateCustomHtmlChange(index, { match_mode: value === "first" ? "first" : "all" }),
+              help: "Choose explicitly when a selector matches more than one element.",
+            }),
+            h(TextareaControl, {
+              label: "Version B HTML",
+              value: String(change.html || ""),
+              onChange: (value) =>
+                updateCustomHtmlChange(index, { html: String(value || "") }),
+              rows: 10,
+              help: customHtmlOperationHelp(change.operation),
+              placeholder: "<strong>New Version B content</strong>",
+            }),
+          ])
+        )
+      )
+    : h(
+        Notice,
+        { status: "info", isDismissible: false },
+        "Select an element in the preview to create your first Version B HTML change."
+      )
+);
+
 /* Step 2 – Build Version B */
-const step2 = postType === "custom_css"
+const step2 = isCustomHtml
+  ? h(Fragment, null, [
+      h(
+        "p",
+        null,
+        "Version A keeps the original page. For Version B, select a target, choose how the HTML should be inserted or replaced, and decide whether to change the first match or every match."
+      ),
+      h(
+        Notice,
+        { status: "info", isDismissible: false },
+        "Saved HTML is sanitised before preview and delivery. Script, style, iframe, object and embed elements, plus unsafe event-handler attributes, are removed."
+      ),
+      h(ClickPreviewModeSelector, {
+        value: htmlPreviewMode,
+        onChange: setHtmlPreviewMode,
+      }),
+      h(ElementPicker, {
+        pageId: pageA && pageA.id,
+        viewBase: getPreviewBase(cssScope),
+        rawUrl: customHtmlPreviewUrl,
+        goal: "custom_html_selector",
+        label: "HTML selector picker",
+        previewMode: htmlPreviewMode,
+        allowAnyElement: true,
+        preferExactElement: true,
+        actionLabel: "Now click the element you want to change…",
+        interactiveWhenNotPicking: true,
+        previewVariant: "B",
+        previewHtmlChanges: customHtmlChanges,
+        showTargetRefreshButton: true,
+        selected: (customHtmlChanges || []).map((change) => change.selector),
+        onWarn: (msg) => {
+          console.warn("[abtestkit custom html picker]", msg);
+        },
+        onPick: addCustomHtmlChange,
+      }),
+      h(
+        "details",
+        {
+          style: {
+            marginTop: 14,
+            padding: "12px 14px",
+            background: "#f6f7f7",
+            border: "1px solid #dcdcde",
+            borderRadius: 8,
+          },
+        },
+        [
+          h(
+            "summary",
+            {
+              style: {
+                cursor: "pointer",
+                fontWeight: 600,
+              },
+            },
+            "Advanced: enter an element selector manually"
+          ),
+          h(
+            "div",
+            { style: { display: "flex", gap: 8, alignItems: "flex-end", marginTop: 8 } },
+            [
+              h(
+                "div",
+                { style: { flex: "1 1 auto" } },
+                h(TextControl, {
+                  label: "Element selector",
+                  value: manualHtmlSelector,
+                  onChange: setManualHtmlSelector,
+                  placeholder: "#hero .wp-block-heading",
+                  help: "Uses CSS selector syntax. Use this when an element is hidden or difficult to click in the preview.",
+                })
+              ),
+              h(
+                Button,
+                {
+                  isSecondary: true,
+                  onClick: addManualCustomHtmlChange,
+                  disabled: String(manualHtmlSelector || "").trim() === "",
+                  style: { marginBottom: 24 },
+                },
+                "Add selector"
+              ),
+            ]
+          ),
+        ]
+      ),
+      customHtmlEditorCards,
+      error &&
+        h(
+          Notice,
+          { status: "error", isDismissible: false, style: { marginTop: 12 } },
+          error
+        ),
+    ])
+  : isCustomCss
   ? h(Fragment, null, [
       h(
         "p",
@@ -4573,13 +5290,7 @@ const step3 = h(Fragment, null, [
             setConversionChosen(true);
             setClickScope("on_test_pages");
           },
-          style: {
-            cursor: "pointer",
-            border:
-              goal === "clicks" ? "2px solid #2271b1" : "1px solid #dcdcde",
-            boxShadow:
-              goal === "clicks" ? "0 0 0 1px #2271b1" : "none",
-          },
+          style: selectableCardStyle(goal === "clicks"),
         },
         h(CardBody, null, [
           h("h3", null, "Clicks"),
@@ -4604,13 +5315,7 @@ const step3 = h(Fragment, null, [
             setGoal("form");
             setConversionChosen(true);
           },
-          style: {
-            cursor: "pointer",
-            border:
-              goal === "form" ? "2px solid #2271b1" : "1px solid #dcdcde",
-            boxShadow:
-              goal === "form" ? "0 0 0 1px #2271b1" : "none",
-          },
+          style: selectableCardStyle(goal === "form"),
         },
         h(CardBody, null, [
           h("h3", null, "Form submissions"),
@@ -4639,13 +5344,7 @@ const step3 = h(Fragment, null, [
             setPrettyPicks([]);
             setShowManualTargets(false);
           },
-          style: {
-            cursor: "pointer",
-            border:
-              goal === "destination_url" ? "2px solid #2271b1" : "1px solid #dcdcde",
-            boxShadow:
-              goal === "destination_url" ? "0 0 0 1px #2271b1" : "none",
-          },
+          style: selectableCardStyle(goal === "destination_url"),
         },
         h(CardBody, null, [
           h("h3", null, "Destination URL"),
@@ -4675,13 +5374,7 @@ const step3 = h(Fragment, null, [
               setPrettyPicks([]);
               setShowManualTargets(false);
             },
-            style: {
-              cursor: "pointer",
-              border:
-                goal === "scroll_depth" ? "2px solid #2271b1" : "1px solid #dcdcde",
-              boxShadow:
-                goal === "scroll_depth" ? "0 0 0 1px #2271b1" : "none",
-            },
+            style: selectableCardStyle(goal === "scroll_depth"),
           },
           h(CardBody, null, [
             h("h3", null, "Scroll depth"),
@@ -4707,15 +5400,7 @@ const step3 = h(Fragment, null, [
               setGoal("add_to_cart");
               setConversionChosen(true);
             },
-            style: {
-              cursor: "pointer",
-              border:
-                goal === "add_to_cart"
-                  ? "2px solid #2271b1"
-                  : "1px solid #dcdcde",
-              boxShadow:
-                goal === "add_to_cart" ? "0 0 0 1px #2271b1" : "none",
-            },
+            style: selectableCardStyle(goal === "add_to_cart"),
           },
           h(CardBody, null, [
             h("h3", null, "Add to cart"),
@@ -4732,7 +5417,7 @@ const step3 = h(Fragment, null, [
           ])
         ),
 
-      // ORDERS (REVENUE) CARD – show for WooCommerce product tests and reusable sections shown on product pages
+      // COMPLETED ORDERS (REVENUE) CARD – show for WooCommerce product tests and reusable sections shown on product pages
       (postType === "product" || postType === "reusable_section") &&
         h(
           Card,
@@ -4741,18 +5426,10 @@ const step3 = h(Fragment, null, [
               setGoal("purchase");
               setConversionChosen(true);
             },
-            style: {
-              cursor: "pointer",
-              border:
-                goal === "purchase"
-                  ? "2px solid #2271b1"
-                  : "1px solid #dcdcde",
-              boxShadow:
-                goal === "purchase" ? "0 0 0 1px #2271b1" : "none",
-            },
+            style: selectableCardStyle(goal === "purchase"),
           },
           h(CardBody, null, [
-            h("h3", null, "Orders (Revenue)"),
+            h("h3", null, "Completed Orders (Revenue)"),
             h(
               "p",
               { style: { marginTop: 4, color: "#50575e" } },
@@ -4778,12 +5455,16 @@ const step3 = h(Fragment, null, [
 
 /* Step 4 – Conversion goal (existing logic, now extended for A/B + other page) */
 const clickPickerRawUrlA =
-  postType === "product" && pageA
+  isCustomCode
+    ? customCodePreviewUrl
+    : postType === "product" && pageA
     ? getProductPreviewUrl(pageA, "A")
     : "";
 
 const clickPickerRawUrlB =
-  postType === "product" && pageA
+  isCustomCode
+    ? customCodePreviewUrl
+    : postType === "product" && pageA
     ? getProductPreviewUrl(
         pageA,
         "B",
@@ -5021,7 +5702,7 @@ const step4 = h(Fragment, null, [
           marginTop: 12,
           display: "grid",
           gridTemplateColumns:
-            pageB && clickPreviewMode !== "desktop"
+            (pageB || isCustomCode) && clickPreviewMode !== "desktop"
               ? "1fr 1fr"
               : "1fr",
           gap: 16,
@@ -5039,7 +5720,7 @@ const step4 = h(Fragment, null, [
             ),
             h(ElementPicker, {
               pageId: pageA.id,
-              viewBase: getPreviewBase(postType),
+              viewBase: getPreviewBase(isCustomCode ? cssScope : postType),
               rawUrl: clickPickerRawUrlA,
               goal,
               label: "Version A",
@@ -5055,7 +5736,7 @@ const step4 = h(Fragment, null, [
             }),
           ]
         ),
-        pageB &&
+        (pageB || isCustomCode) &&
           h(
             "div",
             null,
@@ -5066,12 +5747,20 @@ const step4 = h(Fragment, null, [
                 "Pick targets on Version B"
               ),
               h(ElementPicker, {
-                pageId: postType === "product" ? pageA.id : pageB.id,
-                viewBase: getPreviewBase(postType),
+                pageId: isCustomCode
+                  ? pageA.id
+                  : postType === "product"
+                  ? pageA.id
+                  : pageB.id,
+                viewBase: getPreviewBase(isCustomCode ? cssScope : postType),
                 rawUrl: clickPickerRawUrlB,
                 goal,
                 label: "Version B",
                 previewMode: clickPreviewMode,
+                previewVariant: isCustomCode ? "B" : "",
+                previewCss: isCustomCss ? customCss : "",
+                previewMarkers: isCustomCss ? cssMarkers : [],
+                previewHtmlChanges: isCustomHtml ? customHtmlChanges : [],
                 selected: (links || "")
                   .split(",")
                   .map((s) => s.trim())
@@ -5269,18 +5958,18 @@ const summaryTestTitle =
   String(testTitle || "").trim() || defaultSuggestedTitle;
 
 // Preview URLs for Version A/B in a new tab (no tracking / no impressions)
-const customCssSummaryBaseUrl =
-  postType === "custom_css" && customCssPreviewUrl
-    ? abtkSetPreviewQueryParam(customCssPreviewUrl, "abtestkit_preview", "1")
+const customCodeSummaryBaseUrl =
+  isCustomCode && customCodePreviewUrl
+    ? abtkSetPreviewQueryParam(customCodePreviewUrl, "abtestkit_preview", "1")
     : "";
 
 const previewUrlA =
   pageA
     ? (
-        postType === "custom_css"
+        isCustomCode
           ? abtkSetPreviewQueryParam(
               abtkSetPreviewQueryParam(
-                abtkSetPreviewQueryParam(customCssSummaryBaseUrl, "abtestkit_force", "A"),
+                abtkSetPreviewQueryParam(customCodeSummaryBaseUrl, "abtestkit_force", "A"),
                 "abtestkit_preview",
                 "1"
               ),
@@ -5294,12 +5983,12 @@ const previewUrlA =
     : "";
 
 const previewUrlB =
-  postType === "custom_css"
+  isCustomCode
     ? (
         pageA
           ? abtkSetPreviewQueryParam(
               abtkSetPreviewQueryParam(
-                abtkSetPreviewQueryParam(customCssSummaryBaseUrl, "abtestkit_force", "B"),
+                abtkSetPreviewQueryParam(customCodeSummaryBaseUrl, "abtestkit_force", "B"),
                 "abtestkit_preview",
                 "1"
               ),
@@ -5322,7 +6011,7 @@ const previewUrlB =
       )
     : (pageB ? getEntityPreviewUrl(pageB, postType) : "");
 
-const openCustomCssSummaryPreview = (variant = "B") => {
+const openCustomCodeSummaryPreview = (variant = "B") => {
   const isVersionB = String(variant || "").toUpperCase() === "B";
   const src = isVersionB ? previewUrlB : previewUrlA;
 
@@ -5365,13 +6054,14 @@ const openCustomCssSummaryPreview = (variant = "B") => {
   }
 
   apiFetch({
-    path: "/abtestkit/v1/pt/custom-css-preview",
+    path: isCustomHtml ? "/abtestkit/v1/pt/custom-html-preview" : "/abtestkit/v1/pt/custom-css-preview",
     method: "POST",
     headers: { "X-WP-Nonce": cfg.nonce, "Content-Type": "application/json" },
     data: {
       control_id: parseInt(pageA.id, 10) || 0,
-      custom_css: String(customCss || ""),
-      css_markers: Array.isArray(cssMarkers) ? cssMarkers : [],
+      custom_css: isCustomCss ? String(customCss || "") : "",
+      css_markers: isCustomCss && Array.isArray(cssMarkers) ? cssMarkers : [],
+      html_changes: isCustomHtml && Array.isArray(customHtmlChanges) ? customHtmlChanges : [],
     },
   })
     .then((response) => {
@@ -5383,13 +6073,17 @@ const openCustomCssSummaryPreview = (variant = "B") => {
       let previewSrc = src;
       previewSrc = abtkSetPreviewQueryParam(previewSrc, "abtestkit_preview", "1");
       previewSrc = abtkSetPreviewQueryParam(previewSrc, "abtestkit_force", "B");
-      previewSrc = abtkSetPreviewQueryParam(previewSrc, "abtestkit_custom_css_preview", response.token);
+      previewSrc = abtkSetPreviewQueryParam(
+        previewSrc,
+        isCustomHtml ? "abtestkit_custom_html_preview" : "abtestkit_custom_css_preview",
+        response.token
+      );
       previewSrc = abtkSetPreviewQueryParam(previewSrc, "abtestkit_r", Date.now());
 
       navigatePopup(previewSrc);
     })
     .catch(() => {
-      setError("Could not prepare the Custom CSS preview. Opening the normal preview instead.");
+      setError(`Could not prepare the Custom ${isCustomHtml ? "HTML" : "CSS"} preview. Opening the normal preview instead.`);
       navigatePopup(src);
     });
 };
@@ -5762,7 +6456,11 @@ h(
       h(ListItem, {
         label: "Test type",
         value:
-          postType === "product"
+          isCustomHtml
+            ? "Custom HTML"
+            : isCustomCss
+            ? "Custom CSS"
+            : postType === "product"
             ? "WooCommerce product"
             : postType === "post"
             ? "Post"
@@ -5776,10 +6474,12 @@ h(
         label: "Version A (Control)",
         value: pageA ? decodeEntities(`${pageA.title}`) : "—",
       }),
-      postType === "custom_css"
+      isCustomCode
         ? h(ListItem, {
             label: "Version B",
-            value: "Custom CSS applied to the original page",
+            value: isCustomHtml
+              ? "Custom HTML applied to selected elements on the original page"
+              : "Custom CSS applied to the original page",
           })
         : h(ListItem, {
         label: postType === "product" ? "Version B" : "Version B Source",
@@ -5829,9 +6529,9 @@ h(
             : "—",
       }),
 
-      postType === "custom_css"
+      isCustomCode
         ? h(ListItem, {
-            label: "CSS location",
+            label: isCustomHtml ? "HTML location" : "CSS location",
             value:
               cssScope === "product"
                 ? "WooCommerce product"
@@ -5841,11 +6541,25 @@ h(
           })
         : null,
 
-      postType === "custom_css"
+      isCustomCss
         ? h(ListItem, {
             label: "B-only CSS classes",
             value: cssMarkers.length
               ? cssMarkers.map((marker) => `${marker.label}: .${marker.class_name}`).join(", ")
+              : "None",
+          })
+        : null,
+
+      isCustomHtml
+        ? h(ListItem, {
+            label: "HTML selectors",
+            value: customHtmlChanges.length
+              ? customHtmlChanges
+                  .map(
+                    (change) =>
+                      `${change.label || "Selected element"}: ${change.selector} — ${customHtmlOperationLabel(change.operation)} — ${String(change.match_mode || "all") === "first" ? "first match" : "all matches"}`
+                  )
+                  .join(", ")
               : "None",
           })
         : null,
@@ -5859,7 +6573,7 @@ h(
             : goal === "add_to_cart"
             ? "Add to cart"
             : goal === "purchase"
-            ? "Orders (Revenue)"
+            ? "Completed Orders (Revenue)"
             : goal === "destination_url"
             ? "Destination URL"
             : goal === "scroll_depth"
@@ -5982,10 +6696,10 @@ h(
                       rel: "noopener noreferrer",
                       "aria-label": "Preview Version B",
                       onClick:
-                        postType === "custom_css"
+                        isCustomCode
                           ? (e) => {
                               e.preventDefault();
-                              openCustomCssSummaryPreview("B");
+                              openCustomCodeSummaryPreview("B");
                             }
                           : undefined,
                       style: {
@@ -6035,7 +6749,7 @@ h(
     // ── Updated steps array ─────────────────────────
     // For WooCommerce products we skip the "Version B source" step.
     let steps;
-    if (postType === "custom_css") {
+    if (isCustomCode) {
       steps = [
         {
           title: "Select test type",
@@ -6043,7 +6757,12 @@ h(
           canNext: canNext0,
         },
         {
-          title: "Choose CSS location",
+          title: "Choose code type",
+          content: stepCustomCodeType,
+          canNext: canNextCustomCodeType,
+        },
+        {
+          title: isCustomHtml ? "Choose HTML location" : "Choose CSS location",
           content: step0,
           canNext: canNext1,
         },
@@ -6205,20 +6924,19 @@ h(
     // Determine the absolute index of key steps (varies when click-target step is hidden)
     const showClickTargetsStep = goal === "clicks" || goal === "destination_url" || goal === "scroll_depth";
 
-    const reviewStepIndex = (postType === "product" || postType === "custom_css") ? 2 : 3;
-    const conversionTypeIndex = (postType === "product" || postType === "custom_css") ? 3 : 4;
+    const reviewStepIndex = isCustomCode ? 3 : postType === "product" ? 2 : 3;
+    const conversionTypeIndex = isCustomCode ? 4 : postType === "product" ? 3 : 4;
 
-    // Only exists when goal === "clicks"
     const conversionGoalIndex = showClickTargetsStep
-      ? ((postType === "product" || postType === "custom_css") ? 4 : 5)
+      ? (isCustomCode ? 5 : postType === "product" ? 4 : 5)
       : -1;
 
     // Auto-create the variation (Version B) when entering Build Version B in "duplicate" mode
     const autoCreatedBRef = useRef(false);
 
     useEffect(() => {
-      // Custom CSS does not create a physical Version B page.
-      if (postType === "custom_css") return;
+      // Custom Code tests do not create a physical Version B page.
+      if (isCustomCode) return;
 
       // Only in duplicate mode
       if (bMode !== "duplicate") {
@@ -6241,7 +6959,9 @@ h(
 
     // Build Version B blocking
     if (step === reviewStepIndex && !canGoNext) {
-      if (postType === "custom_css") {
+      if (isCustomHtml) {
+        nextTitle = "Select an element and add Version B HTML";
+      } else if (isCustomCss) {
         nextTitle = "Add Version B CSS";
       } else if (postType === "product") {
         nextTitle = "Edit at least one Version B field";
@@ -6308,7 +7028,7 @@ h(
 onClick: () => {
                     const isClickGoal = goal === "clicks";
                     const isDestinationGoal = goal === "destination_url";
-                    const clickTargetStep = postType === "product" ? 4 : 5;
+                    const clickTargetStep = isCustomCode ? 5 : postType === "product" ? 4 : 5;
                     const leavingClickTargets = (isClickGoal || isDestinationGoal) && step === clickTargetStep;
                     const leavingBuildVersionB = step === reviewStepIndex;
 
@@ -6332,17 +7052,19 @@ onClick: () => {
                       }, 0);
                     };
 
-                    if (leavingBuildVersionB && postType === "custom_css") {
+                    if (leavingBuildVersionB && isCustomCode) {
                       const ok = window.confirm(
-                        "Are you sure you want to go back?\n\nYour unsaved Version B CSS and added class selections will be cleared.\n\nPress OK to continue."
+                        isCustomHtml
+                          ? "Are you sure you want to go back?\n\nYour unsaved Version B HTML changes and selected elements will be cleared.\n\nPress OK to continue."
+                          : "Are you sure you want to go back?\n\nYour unsaved Version B CSS and added class selections will be cleared.\n\nPress OK to continue."
                       );
 
                       if (!ok) return;
 
-                      clearCustomCssState();
+                      clearCustomCodeState();
 
                       tlmSend("pt_wizard_action", {
-                        action: "reset_on_back_from_custom_css_build_b",
+                        action: "reset_on_back_from_custom_code_build_b",
                         value: 1,
                         step: tlmStepKey(),
                       });
@@ -6392,6 +7114,30 @@ onClick: () => {
                         .finally(() => {
                           setLoading(false);
                         });
+
+                      return;
+                    }
+
+                    if (isCustomCode && step === 2 && hasSetupToLose) {
+                      const ok = window.confirm(
+                        "Going back to code type will clear the selected page and any Custom Code progress.\n\nPress OK to continue."
+                      );
+
+                      if (!ok) return;
+
+                      resetToControlSelection();
+                      tlmNavDirRef.current = "back";
+                      setStep(1);
+
+                      tlmSend("pt_wizard_action", {
+                        action: "reset_on_back_to_custom_code_type",
+                        value: 1,
+                        step: tlmStepKey(),
+                      });
+
+                      setTimeout(() => {
+                        window.scrollTo({ top: 0, behavior: "auto" });
+                      }, 0);
 
                       return;
                     }
@@ -6504,9 +7250,12 @@ onClick: () => {
                             const sk = tlmStepKey();
 
                             if (sk === "select_type") reason = "missing_test_type";
+                            else if (sk === "select_custom_code_type") reason = "missing_custom_code_type";
                             else if (sk === "select_control") reason = "missing_control";
                             else if (sk === "version_b_source" && bMode === "existing" && !pageB) reason = "missing_version_b";
-                            else if (sk === "review_versions" && !hasEditedB) reason = "edit_version_b_required";
+                            else if (sk === "review_versions" && isCustomHtml && !hasCompleteCustomHtmlChange) reason = "missing_custom_html";
+                            else if (sk === "review_versions" && isCustomCss && String(customCss || "").trim() === "") reason = "missing_custom_css";
+                            else if (sk === "review_versions" && !isCustomCode && !hasEditedB) reason = "edit_version_b_required";
                             else if (sk === "choose_conversion_type" && !conversionChosen) reason = "missing_goal";
                             else if (sk === "select_click_targets" && goal === "clicks" && tlmLinksCount() < 1) reason = "missing_click_targets";
                             else if (sk === "set_destination_url" && goal === "destination_url" && tlmLinksCount() < 1) reason = "missing_destination_url";

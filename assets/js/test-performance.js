@@ -9,7 +9,7 @@
       click: 'Click',
       form: 'Form submission',
       add_to_cart: 'Add to cart',
-      purchase: 'Orders (Revenue)',
+      purchase: 'Completed Orders (Revenue)',
       destination_url: 'Destination URL',
       scroll_depth: 'Scroll depth',
     };
@@ -22,6 +22,79 @@
     }
     if (!rule) return 'Balanced';
     return String(rule).charAt(0).toUpperCase() + String(rule).slice(1);
+  }
+
+  function getReportingCurrencySettings() {
+    const config =
+      window.abtestkitTestPerformance &&
+      typeof window.abtestkitTestPerformance === 'object'
+        ? window.abtestkitTestPerformance
+        : {};
+    const rawCode = config.currencyCode || config.currency || 'GBP';
+    const code =
+      String(rawCode || '')
+        .trim()
+        .toUpperCase()
+        .replace(/[^A-Z0-9_-]/g, '')
+        .slice(0, 12) || 'GBP';
+    const rawDecimals = Number(config.currencyDecimals);
+    const decimals = Number.isInteger(rawDecimals)
+      ? Math.max(0, Math.min(20, rawDecimals))
+      : 2;
+
+    return { code, decimals };
+  }
+
+  function formatReportingCurrency(value, settings) {
+    const numericValue = Number(value);
+    const amount = Number.isFinite(numericValue) ? numericValue : 0;
+    const currencySettings = settings || getReportingCurrencySettings();
+    const code = currencySettings.code || 'GBP';
+    const decimals = currencySettings.decimals;
+
+    if (
+      /^[A-Z]{3}$/.test(code) &&
+      typeof Intl !== 'undefined' &&
+      typeof Intl.NumberFormat === 'function'
+    ) {
+      try {
+        return new Intl.NumberFormat(undefined, {
+          style: 'currency',
+          currency: code,
+          minimumFractionDigits: decimals,
+          maximumFractionDigits: decimals,
+        }).format(amount);
+      } catch (_) {
+        // Custom/unsupported currencies fall through to the code-based label.
+      }
+    }
+
+    return `${amount.toFixed(decimals)} ${code}`;
+  }
+
+  function formatActiveTime(value) {
+    const numericValue = Number(value);
+
+    if (!Number.isFinite(numericValue) || numericValue < 0) {
+      return '—';
+    }
+
+    const seconds = Math.round(numericValue);
+
+    if (seconds < 60) {
+      return `${seconds}s`;
+    }
+
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+
+    if (minutes < 60) {
+      return `${minutes}m ${remainingSeconds}s`;
+    }
+
+    const hours = Math.floor(minutes / 60);
+    const remainingMinutes = minutes % 60;
+    return `${hours}h ${remainingMinutes}m`;
   }
 
   function getClickTargetsFromPayload(test) {
@@ -1184,6 +1257,7 @@
     const [isEditingTitle, setIsEditingTitle] = useState(false);
     const [draftTitle, setDraftTitle] = useState('');
     const [openHelp, setOpenHelp] = useState(null);
+    const [hoverHelp, setHoverHelp] = useState(null);
     const [isActionsOpen, setIsActionsOpen] = useState(false);
     const [rowsPerPage, setRowsPerPage] = useState(10);
     const [currentPage, setCurrentPage] = useState(1);
@@ -1279,7 +1353,11 @@
     }, [payload && payload.url]);
 
     useEffect(() => {
-      if (!payload || !shouldOpenHealthFromUrl()) {
+      if (
+        !payload ||
+        String(payload.status || '') === 'complete' ||
+        !shouldOpenHealthFromUrl()
+      ) {
         return;
       }
 
@@ -1292,7 +1370,7 @@
           healthCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
       }, 80);
-    }, [payload && payload.id]);
+    }, [payload && payload.id, payload && payload.status]);
 
     useEffect(() => {
       const handleDocumentClick = () => {
@@ -1304,80 +1382,102 @@
       return () => document.removeEventListener('click', handleDocumentClick);
     }, []);
 
-    const helpTip = (id, content, side = 'right') =>
-    h(
-      'span',
-      {
-        style: {
-          position: 'relative',
-          display: 'inline-flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          marginLeft: '6px',
-          flex: '0 0 auto',
-          verticalAlign: 'middle',
-        },
-      },
-      [
-        h(
-          'span',
-          {
-            onClick: (e) => {
-              e.stopPropagation();
-              setOpenHelp(openHelp === id ? null : id);
-            },
-            style: {
-              display: 'inline-flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              width: '16px',
-              height: '16px',
-              minWidth: '16px',
-              minHeight: '16px',
-              borderRadius: '999px',
-              border: '1px solid #c3c4c7',
-              color: '#50575e',
-              fontSize: '11px',
-              fontWeight: '700',
-              lineHeight: '1',
-              cursor: 'pointer',
-              userSelect: 'none',
-              background: '#fff',
-              boxSizing: 'border-box',
-            },
-            'aria-label': content,
-            title: content,
-          },
-          '?'
-        ),
+    const helpTip = (id, content, side = 'right') => {
+      const tooltipId = `abtestkit-help-${id}`;
+      const isVisible = (hoverHelp || openHelp) === id;
 
-        openHelp === id &&
+      return h(
+        'span',
+        {
+          onMouseEnter: () => setHoverHelp(id),
+          onMouseLeave: () => setHoverHelp(null),
+          style: {
+            position: 'relative',
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            marginLeft: '6px',
+            flex: '0 0 auto',
+            verticalAlign: 'middle',
+          },
+        },
+        [
           h(
-            'div',
+            'button',
             {
-              style: {
-                position: 'absolute',
-                top: '26px',
-                left: side === 'left' ? 'auto' : '0',
-                right: side === 'left' ? '0' : 'auto',
-                transform: 'none',
-                zIndex: 100000,
-                width: '220px',
-                padding: '8px 10px',
-                background: '#fff',
-                border: '1px solid #ccd0d4',
-                borderRadius: '4px',
-                boxShadow: '0 4px 12px rgba(0,0,0,0.08)',
-                fontSize: '12px',
-                lineHeight: '1.4',
-                color: '#1d2327',
-                textAlign: 'left',
+              type: 'button',
+              onFocus: () => setHoverHelp(id),
+              onBlur: () => setHoverHelp(null),
+              onClick: (e) => {
+                e.stopPropagation();
+                setOpenHelp(openHelp === id ? null : id);
               },
+              onKeyDown: (e) => {
+                if (e.key === 'Escape') {
+                  setOpenHelp(null);
+                  setHoverHelp(null);
+                  e.currentTarget.blur();
+                }
+              },
+              style: {
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: '16px',
+                height: '16px',
+                minWidth: '16px',
+                minHeight: '16px',
+                padding: 0,
+                borderRadius: '999px',
+                border: '1px solid #8c8f94',
+                color: '#50575e',
+                fontSize: '11px',
+                fontWeight: '700',
+                lineHeight: '1',
+                cursor: 'help',
+                userSelect: 'none',
+                background: '#fff',
+                boxSizing: 'border-box',
+              },
+              'aria-label': `More information: ${content}`,
+              'aria-describedby': isVisible ? tooltipId : undefined,
+              'aria-expanded': isVisible ? 'true' : 'false',
             },
-            content
+            '?'
           ),
-      ]
-    );
+
+          isVisible &&
+            h(
+              'span',
+              {
+                id: tooltipId,
+                role: 'tooltip',
+                style: {
+                  position: 'absolute',
+                  top: '24px',
+                  left: side === 'left' ? 'auto' : '0',
+                  right: side === 'left' ? '0' : 'auto',
+                  zIndex: 100000,
+                  width: 'max-content',
+                  minWidth: '160px',
+                  maxWidth: '260px',
+                  padding: '8px 10px',
+                  background: '#2d3e50',
+                  borderRadius: '4px',
+                  boxShadow: '0 4px 12px rgba(0,0,0,0.18)',
+                  fontSize: '12px',
+                  fontWeight: '400',
+                  lineHeight: '1.4',
+                  color: '#fff',
+                  textAlign: 'left',
+                  whiteSpace: 'normal',
+                },
+              },
+              content
+            ),
+        ]
+      );
+    };
 
     const openCompatibilityHelpModal = (context = 'performance_page') => {
       setIsActionsOpen(false);
@@ -1539,16 +1639,10 @@
         return;
       }
 
-      if (!window.confirm('Delete this test?')) {
-        return;
-      }
-
       const kind = String(payload.kind || '');
-
       const hasOutcome =
         !!payload.winner || payload.status === 'complete';
-
-      const canOfferDeleteB =
+      const hasPhysicalVersionB =
         !hasOutcome &&
         (
           kind === 'page' ||
@@ -1557,21 +1651,24 @@
           kind === 'product'
         );
 
-      if (canOfferDeleteB) {
-        const deleteMessage =
-          kind === 'product'
-            ? 'Would you like to delete Version B shadow product?'
-            : 'Would you like to delete Version B?';
+      let deleteMessage = 'Delete this test? This cannot be undone.';
 
-        const alsoDeleteVariant = window.confirm(deleteMessage);
-
-        if (alsoDeleteVariant) {
-          submitPtAction('delete', { trash_b: '1' });
-          return;
-        }
+      if (hasPhysicalVersionB && kind === 'product') {
+        deleteMessage =
+          'Delete this test and its Version B shadow product? Version A will not be changed. This cannot be undone.';
+      } else if (hasPhysicalVersionB) {
+        deleteMessage =
+          'Delete this test? Any Version B created by abtestkit will also be deleted. Existing content selected as Version B will not be deleted. This cannot be undone.';
       }
 
-      submitPtAction('delete');
+      if (!window.confirm(deleteMessage)) {
+        return;
+      }
+
+      submitPtAction(
+        'delete',
+        hasPhysicalVersionB ? { trash_b: '1' } : {}
+      );
     };
 
     const resetTest = () => {
@@ -1665,6 +1762,8 @@
         const confirmed = window.confirm(
           payload.kind === 'custom_css'
             ? 'Apply Version B winner? This will mark the Custom CSS version as the winner and complete the test. It will not edit the page content.'
+            : payload.kind === 'custom_html'
+            ? 'Apply Version B winner? This will mark the Custom HTML version as the winner and complete the test. It will not edit the original page content.'
             : payload.kind === 'product'
             ? 'Apply Version B winner? This will apply Version B changes to the live product and complete the test.'
             : 'Apply Version B winner? This will replace Version A with Version B and complete the test.'
@@ -1778,7 +1877,11 @@ if (loading && !payload) {
     }
 
     const stats = payload.stats || { A: {}, B: {} };
+    const engagement = payload.engagement || {};
+    const engagementA = engagement.A || {};
+    const engagementB = engagement.B || {};
     const timeline = payload.timeline || [];
+    const isComplete = String(payload.status || '') === 'complete';
     const isRevenueGoal = payload.goal === 'purchase';
     const previewA = payload.preview_a || '';
     const previewB = payload.preview_b || '';
@@ -1796,6 +1899,16 @@ if (loading && !payload) {
         : payload.css_scope === 'post'
         ? 'Post'
         : payload.css_scope === 'page'
+        ? 'Page'
+        : '—';
+    const isCustomHtml = String(payload.kind || '') === 'custom_html';
+    const customHtmlChanges = Array.isArray(payload.html_changes) ? payload.html_changes : [];
+    const customHtmlScopeLabel =
+      payload.html_scope === 'product'
+        ? 'WooCommerce product'
+        : payload.html_scope === 'post'
+        ? 'Post'
+        : payload.html_scope === 'page'
         ? 'Page'
         : '—';
     const scrollDepth = Number(payload.scroll_depth || 50);
@@ -1846,6 +1959,20 @@ if (loading && !payload) {
     const totalRevenueB = Number((stats.B && stats.B.revenue) || 0);
     const rpcA = Number((stats.A && stats.A.revenue_per_customer) || 0);
     const rpcB = Number((stats.B && stats.B.revenue_per_customer) || 0);
+    const engagementSampleCountA = Number(engagementA.count || 0);
+    const engagementSampleCountB = Number(engagementB.count || 0);
+    const avgPageDepthA = engagementSampleCountA > 0
+      ? `${Math.round(Number(engagementA.avg_scroll || 0))}%`
+      : '—';
+    const avgPageDepthB = engagementSampleCountB > 0
+      ? `${Math.round(Number(engagementB.avg_scroll || 0))}%`
+      : '—';
+    const avgActiveTimeA = engagementSampleCountA > 0
+      ? formatActiveTime(engagementA.avg_time)
+      : '—';
+    const avgActiveTimeB = engagementSampleCountB > 0
+      ? formatActiveTime(engagementB.avg_time)
+      : '—';
 
     const rpvA = totalImpA > 0 ? (totalRevenueA / totalImpA) : 0;
     const rpvB = totalImpB > 0 ? (totalRevenueB / totalImpB) : 0;
@@ -1885,13 +2012,8 @@ if (loading && !payload) {
       percentB = 100 - percentA;
     }
 
-    const currency = (value) =>
-      new Intl.NumberFormat(undefined, {
-        style: 'currency',
-        currency: 'GBP',
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-      }).format(Number(value || 0));
+    const currencySettings = getReportingCurrencySettings();
+    const currency = (value) => formatReportingCurrency(value, currencySettings);
 
     const winningVersion =
       leaderMetricB > leaderMetricA ? 'B' :
@@ -2335,7 +2457,7 @@ if (loading && !payload) {
                     })
                   ),
 
-                  h(HealthStatusPill, { health }),
+                  !isComplete && h(HealthStatusPill, { health }),
                 ]
               ),
                 h(
@@ -2518,37 +2640,38 @@ if (loading && !payload) {
                           },
                         },
                         [
-                          h(
-                            'button',
-                            {
-                              type: 'button',
-                              onClick: () => {
-                                setIsActionsOpen(false);
+                          !isComplete &&
+                            h(
+                              'button',
+                              {
+                                type: 'button',
+                                onClick: () => {
+                                  setIsActionsOpen(false);
 
-                                const healthCard = document.getElementById('abtestkit-test-health');
-                                if (healthCard && typeof healthCard.scrollIntoView === 'function') {
-                                  healthCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                                }
+                                  const healthCard = document.getElementById('abtestkit-test-health');
+                                  if (healthCard && typeof healthCard.scrollIntoView === 'function') {
+                                    healthCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                                  }
+                                },
+                                style: {
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'space-between',
+                                  gap: '12px',
+                                  width: '100%',
+                                  textAlign: 'left',
+                                  padding: '10px 14px',
+                                  border: '0',
+                                  background: '#fff',
+                                  cursor: 'pointer',
+                                  fontSize: '13px',
+                                },
                               },
-                              style: {
-                                display: 'flex',
-                                alignItems: 'center',
-                                justifyContent: 'space-between',
-                                gap: '12px',
-                                width: '100%',
-                                textAlign: 'left',
-                                padding: '10px 14px',
-                                border: '0',
-                                background: '#fff',
-                                cursor: 'pointer',
-                                fontSize: '13px',
-                              },
-                            },
-                            [
-                              h('span', null, 'Health check'),
-                              h(HealthStatusPill, { health }),
-                            ]
-                          ),
+                              [
+                                h('span', null, 'Health check'),
+                                h(HealthStatusPill, { health }),
+                              ]
+                            ),
 
                           payload && payload.status !== 'complete'
                             ? (
@@ -2827,6 +2950,103 @@ if (loading && !payload) {
                   ]
                 ),
               ]),
+            isCustomHtml &&
+              h('div', { style: { ...cardStyle, gridColumn: '1 / -1' } }, [
+                h('div', { style: statLabelStyle }, 'Custom HTML setup'),
+                h(
+                  'div',
+                  {
+                    style: {
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+                      gap: '12px',
+                      marginTop: '8px',
+                    },
+                  },
+                  [
+                    h('div', null, [
+                      h('div', { style: { fontWeight: 700, marginBottom: '2px' } }, 'Location type'),
+                      h('div', null, customHtmlScopeLabel),
+                    ]),
+                    h('div', null, [
+                      h('div', { style: { fontWeight: 700, marginBottom: '2px' } }, 'Version A'),
+                      h('div', null, 'Original page'),
+                    ]),
+                    h('div', null, [
+                      h('div', { style: { fontWeight: 700, marginBottom: '2px' } }, 'Version B'),
+                      h(
+                        'div',
+                        null,
+                        customHtmlChanges.length
+                          ? `${customHtmlChanges.length} ${customHtmlChanges.length === 1 ? 'change' : 'changes'} saved`
+                          : 'No HTML changes saved'
+                      ),
+                    ]),
+                  ]
+                ),
+                h(
+                  'div',
+                  { style: { marginTop: '12px' } },
+                  [
+                    h('div', { style: { fontWeight: 700, marginBottom: '6px' } }, 'HTML targets'),
+                    customHtmlChanges.length
+                      ? h(
+                          'div',
+                          {
+                            style: {
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: '8px',
+                            },
+                          },
+                          customHtmlChanges.map((change, index) => {
+                            const operationLabel = {
+                              replace_contents: 'Replace contents',
+                              insert_before: 'Insert before',
+                              insert_after: 'Insert after',
+                              prepend_inside: 'Prepend inside',
+                              append_inside: 'Append inside',
+                            }[String(change.operation || 'replace_contents')] || 'Replace contents';
+                            const matchLabel = String(change.match_mode || 'all') === 'first'
+                              ? 'First match'
+                              : 'All matches';
+
+                            return h(
+                              'div',
+                              {
+                                key: `${change.selector || 'selector'}-${index}`,
+                                style: {
+                                  background: '#f6f7f7',
+                                  border: '1px solid #e5e7eb',
+                                  borderRadius: '6px',
+                                  padding: '10px 12px',
+                                },
+                              },
+                              [
+                                h('div', { style: { fontWeight: 700 } }, change.label || `HTML change ${index + 1}`),
+                                h('code', { style: { display: 'inline-block', marginTop: '6px' } }, change.selector || '—'),
+                                h(
+                                  'div',
+                                  { style: { fontSize: '12px', color: '#6b7280', marginTop: '4px' } },
+                                  `${operationLabel} · ${matchLabel}`
+                                ),
+                              ]
+                            );
+                          })
+                        )
+                      : h(
+                          'div',
+                          {
+                            style: {
+                              color: '#6b7280',
+                              fontSize: '13px',
+                            },
+                          },
+                          'No Version B HTML targets were saved.'
+                        ),
+                  ]
+                ),
+              ]),
             (isClickGoal || isDestinationUrlGoal) &&
               h('div', { style: { ...cardStyle, gridColumn: '1 / -1' } }, [
                 h(
@@ -3039,13 +3259,14 @@ if (loading && !payload) {
             ]),
           ]
         ),
-        h(TestHealthCard, {
-          key: 'test-health-card',
-          health,
-          compatibilityHelpButton,
-          isOpen: isHealthOpen,
-          onToggle: setIsHealthOpen,
-        }),
+        !isComplete &&
+          h(TestHealthCard, {
+            key: 'test-health-card',
+            health,
+            compatibilityHelpButton,
+            isOpen: isHealthOpen,
+            onToggle: setIsHealthOpen,
+          }),
         h(
           'div',
           {
@@ -3311,6 +3532,44 @@ if (loading && !payload) {
                   ),
                   h('div', { style: statValueStyle }, `${rateA}%`),
                 ]),
+                h('div', {
+                    'data-engagement-variant': 'A',
+                    'data-engagement-metric': 'page-depth',
+                  }, [
+                    h(
+                      'div',
+                      { style: statLabelStyle },
+                      [
+                        'Avg. Page Depth Reached',
+                        helpTip(
+                          'page-depth-a',
+                          engagementSampleCountA > 0
+                            ? 'The average furthest point reached on the page.'
+                            : 'No data yet. Results will appear after the live test receives visits.'
+                        ),
+                      ]
+                    ),
+                    h('div', { style: statValueStyle }, avgPageDepthA),
+                  ]),
+                h('div', {
+                    'data-engagement-variant': 'A',
+                    'data-engagement-metric': 'active-time',
+                  }, [
+                    h(
+                      'div',
+                      { style: statLabelStyle },
+                      [
+                        'Avg. Visible-Tab Time',
+                        helpTip(
+                          'active-time-a',
+                          engagementSampleCountA > 0
+                            ? 'The average time the page remained visible in the browser.'
+                            : 'No data yet. Results will appear after the live test receives visits.'
+                        ),
+                      ]
+                    ),
+                    h('div', { style: statValueStyle }, avgActiveTimeA),
+                  ]),
                 isRevenueGoal &&
                   h('div', null, [
                     h(
@@ -3491,6 +3750,46 @@ if (loading && !payload) {
                   ),
                   h('div', { style: statValueStyle }, `${rateB}%`),
                 ]),
+                h('div', {
+                    'data-engagement-variant': 'B',
+                    'data-engagement-metric': 'page-depth',
+                  }, [
+                    h(
+                      'div',
+                      { style: statLabelStyle },
+                      [
+                        'Avg. Page Depth Reached',
+                        helpTip(
+                          'page-depth-b',
+                          engagementSampleCountB > 0
+                            ? 'The average furthest point reached on the page.'
+                            : 'No data yet. Results will appear after the live test receives visits.',
+                          'left'
+                        ),
+                      ]
+                    ),
+                    h('div', { style: statValueStyle }, avgPageDepthB),
+                  ]),
+                h('div', {
+                    'data-engagement-variant': 'B',
+                    'data-engagement-metric': 'active-time',
+                  }, [
+                    h(
+                      'div',
+                      { style: statLabelStyle },
+                      [
+                        'Avg. Visible-Tab Time',
+                        helpTip(
+                          'active-time-b',
+                          engagementSampleCountB > 0
+                            ? 'The average time the page remained visible in the browser.'
+                            : 'No data yet. Results will appear after the live test receives visits.',
+                          'left'
+                        ),
+                      ]
+                    ),
+                    h('div', { style: statValueStyle }, avgActiveTimeB),
+                  ]),
                 isRevenueGoal &&
                   h('div', null, [
                     h(

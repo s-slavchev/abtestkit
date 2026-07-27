@@ -443,6 +443,40 @@
       form.submit();
     };
 
+    const getDeleteConfirmation = (test) => {
+      const kind = String((test && test.kind) || '');
+      const hasOutcome = !!(test && test.winner) || (test && test.status) === 'complete';
+      const hasPhysicalVersionB =
+        !hasOutcome &&
+        (
+          kind === 'page' ||
+          kind === 'post' ||
+          kind === 'reusable_section' ||
+          kind === 'product'
+        );
+
+      if (!hasPhysicalVersionB) {
+        return {
+          message: 'Delete this test? This cannot be undone.',
+          extraFields: {},
+        };
+      }
+
+      if (kind === 'product') {
+        return {
+          message:
+            'Delete this test and its Version B shadow product? Version A will not be changed. This cannot be undone.',
+          extraFields: { trash_b: '1' },
+        };
+      }
+
+      return {
+        message:
+          'Delete this test? Any Version B created by abtestkit will also be deleted. Existing content selected as Version B will not be deleted. This cannot be undone.',
+        extraFields: { trash_b: '1' },
+      };
+    };
+
     const resetDashboardTest = (testId) => {
       const confirmed = window.confirm(
         'Are you sure? Resetting the test will set all metrics to zero.'
@@ -799,6 +833,16 @@
                     : t.css_scope === 'page'
                     ? 'Page'
                     : '—';
+                const isCustomHtml = String(t.kind || '') === 'custom_html';
+                const customHtmlChanges = Array.isArray(t.html_changes) ? t.html_changes : [];
+                const customHtmlScopeLabel =
+                  t.html_scope === 'product'
+                    ? 'WooCommerce product'
+                    : t.html_scope === 'post'
+                    ? 'Post'
+                    : t.html_scope === 'page'
+                    ? 'Page'
+                    : '—';
 
                 const decisionProfile =
                   t.decision_profile ||
@@ -826,7 +870,7 @@
                   if (s === 'scroll_depth' || s === 'scroll-depth' || s.includes('scroll depth')) return 'Scroll depth';
                   if (s === 'add_to_cart' || s === 'add-to-cart' || s.includes('add to cart')) return 'Add to cart';
                   if (s === 'submit' || s.includes('form')) return 'Form submission';
-                  if (s === 'purchase' || s.includes('order')) return 'Orders (Revenue)';
+                  if (s === 'purchase' || s.includes('order')) return 'Completed Orders (Revenue)';
 
                   // fallback: Title Case the raw value
                   return String(raw)
@@ -978,6 +1022,59 @@
                       h('div', { style: { fontWeight: 700, marginBottom: '2px' } }, 'B-only markers'),
                       h('div', null, customCssMarkers.length ? `${customCssMarkers.length} saved` : 'None'),
                     ]),
+                    isCustomHtml && h('div', null, [
+                      h('div', { style: { fontWeight: 700, marginBottom: '2px' } }, 'Location'),
+                      h('div', null, customHtmlScopeLabel),
+                    ]),
+                    isCustomHtml && h('div', null, [
+                      h('div', { style: { fontWeight: 700, marginBottom: '2px' } }, 'Version B HTML'),
+                      h(
+                        'div',
+                        null,
+                        customHtmlChanges.length
+                          ? `${customHtmlChanges.length} ${customHtmlChanges.length === 1 ? 'change' : 'changes'} saved`
+                          : 'Missing'
+                      ),
+                    ]),
+                    isCustomHtml && h('div', { style: { gridColumn: '1 / -1' } }, [
+                      h('div', { style: { fontWeight: 700, marginBottom: '4px' } }, 'HTML selectors'),
+                      customHtmlChanges.length
+                        ? h(
+                            'div',
+                            {
+                              style: {
+                                display: 'flex',
+                                flexWrap: 'wrap',
+                                gap: '6px',
+                              },
+                            },
+                            customHtmlChanges.map((change, index) => {
+                              const operationLabel = {
+                                replace_contents: 'Replace contents',
+                                insert_before: 'Insert before',
+                                insert_after: 'Insert after',
+                                prepend_inside: 'Prepend inside',
+                                append_inside: 'Append inside',
+                              }[String(change.operation || 'replace_contents')] || 'Replace contents';
+                              const matchLabel = String(change.match_mode || 'all') === 'first'
+                                ? 'First match'
+                                : 'All matches';
+
+                              return h(
+                                'div',
+                                {
+                                  key: `${change.selector || 'selector'}-${index}`,
+                                  style: { display: 'inline-flex', alignItems: 'center', gap: '5px' },
+                                },
+                                [
+                                  h('code', null, change.selector || '—'),
+                                  h('span', { style: { color: '#6b7280' } }, `${operationLabel} · ${matchLabel}`),
+                                ]
+                              );
+                            })
+                          )
+                        : h('div', null, 'None'),
+                    ]),
                     isScrollDepthGoal && h('div', null, [
                       h('div', { style: { fontWeight: 700, marginBottom: '2px' } }, 'Scroll Depth'),
                       h('div', null, `${scrollDepth}% of the page`),
@@ -1067,7 +1164,7 @@
                             ]
                           ),
 
-                          (t.kind === 'reusable_section' || t.kind === 'custom_css') &&
+                          (t.kind === 'reusable_section' || t.kind === 'custom_css' || t.kind === 'custom_html') &&
                             t.testing_title &&
                             h(
                               'div',
@@ -1079,7 +1176,7 @@
                                   color: '#50575e',
                                 },
                               },
-                              (t.kind === 'custom_css' ? 'Location: ' : 'Testing: ') + t.testing_title
+                              (t.kind === 'custom_css' || t.kind === 'custom_html' ? 'Location: ' : 'Testing: ') + t.testing_title
                             ),
 
                           (previewA || previewB) &&
@@ -1123,19 +1220,20 @@
                               ]
                             ),
 
-                          h(
-                            'div',
-                            {
-                              style: {
-                                marginTop: '6px',
-                                paddingLeft: '30px',
+                          !isComplete &&
+                            h(
+                              'div',
+                              {
+                                style: {
+                                  marginTop: '6px',
+                                  paddingLeft: '30px',
+                                },
                               },
-                            },
-                            h(HealthStatusPill, {
-                              health,
-                              href: healthPerformanceUrl,
-                            })
-                          )
+                              h(HealthStatusPill, {
+                                health,
+                                href: healthPerformanceUrl,
+                              })
+                            )
                         )
                       ),
                       h(
@@ -1429,37 +1527,13 @@
                                       onClick: () => {
                                         setOpenActionsRow(null);
 
-                                        if (!window.confirm('Delete this test?')) {
+                                        const confirmation = getDeleteConfirmation(t);
+
+                                        if (!window.confirm(confirmation.message)) {
                                           return;
                                         }
 
-                                        const kind = String(t.kind || '');
-                                        const hasOutcome = !!t.winner || t.status === 'complete';
-
-                                        const canOfferDeleteB =
-                                          !hasOutcome &&
-                                          (
-                                            kind === 'page' ||
-                                            kind === 'post' ||
-                                            kind === 'reusable_section' ||
-                                            kind === 'product'
-                                          );
-
-                                        if (canOfferDeleteB) {
-                                          const deleteMessage =
-                                            kind === 'product'
-                                              ? 'Would you like to delete Version B shadow product?'
-                                              : 'Would you like to delete Version B?';
-
-                                          const alsoDeleteVariant = window.confirm(deleteMessage);
-
-                                          if (alsoDeleteVariant) {
-                                            submitPtAction(t.id, 'delete', { trash_b: '1' });
-                                            return;
-                                          }
-                                        }
-
-                                        submitPtAction(t.id, 'delete');
+                                        submitPtAction(t.id, 'delete', confirmation.extraFields);
                                       },
                                       style: {
                                         display: 'block',

@@ -189,6 +189,65 @@
     if (textarea) state.detail = textarea.value || '';
   }
 
+  function getWizardSnapshot() {
+    try {
+      var raw = window.localStorage.getItem('abtk_pt_wizard_session');
+      var saved = raw ? JSON.parse(raw) : null;
+
+      if (!saved || typeof saved !== 'object' || Array.isArray(saved)) {
+        return {};
+      }
+
+      var lastSeen = Number(saved.last_seen || 0);
+      var ageSeconds = lastSeen > 0
+        ? Math.max(0, Math.round((Date.now() - lastSeen) / 1000))
+        : 0;
+
+      // Keep this list aligned with the server allow-list. Never include
+      // titles, IDs, URLs, selectors, custom code/content or error messages.
+      return {
+        ui: saved.ui,
+        step: saved.step,
+        step_index: saved.step_index,
+        furthest_step: saved.furthest_step,
+        furthest_step_index: saved.furthest_step_index,
+        ms: saved.ms,
+        age_seconds: ageSeconds,
+        completed: saved.completed,
+        result: saved.result,
+        kind: saved.kind,
+        custom_code_type: saved.custom_code_type,
+        scope: saved.scope,
+        b_mode: saved.b_mode,
+        has_control: saved.has_control,
+        has_variant: saved.has_variant,
+        has_temp_variant: saved.has_temp_variant,
+        edited_variant: saved.edited_variant,
+        seo_safe_existing_b: saved.seo_safe_existing_b,
+        goal: saved.goal,
+        conversion_chosen: saved.conversion_chosen,
+        click_scope: saved.click_scope,
+        links_count: saved.links_count,
+        scroll_depth: saved.scroll_depth,
+        decision_mode: saved.decision_mode,
+        decision_rule: saved.decision_rule,
+        custom_css_length: saved.custom_css_length,
+        css_marker_count: saved.css_marker_count,
+        html_change_count: saved.html_change_count,
+        has_error: saved.has_error,
+        product_title_changed: saved.product_title_changed,
+        product_price_changed: saved.product_price_changed,
+        product_sale_price_changed: saved.product_sale_price_changed,
+        product_short_description_changed: saved.product_short_description_changed,
+        product_long_description_changed: saved.product_long_description_changed,
+        product_image_changed: saved.product_image_changed,
+        product_gallery_changed: saved.product_gallery_changed
+      };
+    } catch (e) {
+      return {};
+    }
+  }
+
   function buildModal() {
     var overlay = document.createElement('div');
     overlay.id = 'abtestkit-delete-reason-modal';
@@ -303,7 +362,8 @@
         reason: state.reason,
         detail_tag: state.detailTag,
         area: state.area,
-        detail: state.detail
+        detail: state.detail,
+        wizard: getWizardSnapshot()
       })
     }).catch(function () {});
   }

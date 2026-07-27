@@ -4,7 +4,7 @@ Tags: ab testing, split testing, ab testing WooCommerce, split testing WooCommer
 Requires at least: 6.3
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.5.0
+Stable tag: 1.5.1
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 Plugin URI: https://www.abtestkit.io/
@@ -73,7 +73,7 @@ abtestkit helps you find it.
 ### Key features
 ✅ WooCommerce product A/B testing with revenue-focused insights  
 ✅ Full-page testing for landing pages, sales pages and content pages
-✅ CSS testing on products, pages &  posts
+✅ CSS & HTML testing on products, pages &  posts
 ✅ Product SKU & stock safe testing architecture
 ✅ Test variables on products like sizes & colors
 ✅ Version B shadow product kept out of shop loops, search and public listings  
@@ -147,6 +147,12 @@ https://www.abtestkit.io/privacy-policy/
 https://www.abtestkit.io/terms-and-conditions/
 
 == Changelog ==
+
+= 1.5.1 =
+* Custom HTML testing added.
+* Improved UI.
+* Improved analytics for visitor interactions & currency reporting.
+* Bug fixes and performance improvements.
 
 = 1.5.0 =
 * Custom CSS testing added.
@@ -304,6 +310,9 @@ https://www.abtestkit.io/terms-and-conditions/
 * Optional anonymous telemetry (opt-in).  
 
 == Upgrade Notice ==
+
+= 1.5.1 =
+Adds Custom HTML testing to pages, posts and products. Improves reporting. Fixes bugs and improves performance.
 
 = 1.5.0 =
 Adds Custom CSS testing to pages, posts and products. fixes bugs and improves performance.
